@@ -12,6 +12,7 @@ FreeCycle sits in your Windows system tray and watches for GPU-intensive games a
 - Tracks VRAM usage from non-whitelisted processes (50% threshold, configurable)
 - Starts/stops Ollama automatically with network exposure (`OLLAMA_HOST=0.0.0.0:11434`)
 - Auto-downloads and updates required models (`llama3.1:8b-instruct-q4_K_M`, `nomic-embed-text`)
+- Waits 60 seconds after Windows resume before re-enabling Ollama (configurable)
 - Provides an HTTP API (port 7443) for external agents to signal GPU task start/stop
 - Color-coded tray icon: green (available), red (blocked), blue (agent task), yellow (downloading), grey (error)
 - Self-registers for Windows auto-start; disables Ollama's own auto-start
@@ -60,7 +61,7 @@ FreeCycle registers itself to start automatically when you log into Windows. The
 | Color  | Meaning                                    |
 |--------|--------------------------------------------|
 | Green  | GPU available, Ollama running              |
-| Red    | Game detected or cooldown active           |
+| Red    | Game detected, cooldown active, or wake delay active |
 | Blue   | External agent task in progress            |
 | Yellow | Downloading/updating models                |
 | Grey   | Error or initializing                      |
@@ -68,7 +69,7 @@ FreeCycle registers itself to start automatically when you log into Windows. The
 ### Right-Click Menu
 
 - **Status**: Shows current state (read-only label)
-- **Force Enable Ollama**: Override and start Ollama
+- **Force Enable Ollama**: Override and start Ollama immediately until a newly detected blocked state clears it. A post-resume wake delay clears this override.
 - **Force Disable Ollama**: Override and stop Ollama
 - **Open Logs**: Opens the verbose log in Notepad
 - **Open Config**: Opens config.toml in Notepad
@@ -119,7 +120,7 @@ bind_address = "0.0.0.0"
 
 ## Agent Signal API
 
-External agentic workflows can signal task start/stop to FreeCycle via HTTP.
+External agentic workflows can signal task start/stop to FreeCycle via HTTP. This is still the right path for direct integrations and custom jobs that do not go through the shipped MCP tools.
 
 ### Endpoints
 
@@ -139,7 +140,7 @@ Turns the tray icon blue and shows the task in the tooltip.
 Clears the task and reverts the icon to green.
 
 **GET /health**
-Returns 200 OK if FreeCycle is running.
+Returns JSON health data such as `{"ok": true, "message": "FreeCycle is running"}`.
 
 ### Example
 
@@ -148,6 +149,14 @@ curl http://192.168.1.10:7443/status
 curl -X POST http://192.168.1.10:7443/task/start -H "Content-Type: application/json" -d '{"task_id":"job-1","description":"Training run"}'
 curl -X POST http://192.168.1.10:7443/task/stop -H "Content-Type: application/json" -d '{"task_id":"job-1"}'
 ```
+
+## MCP Server
+
+The repository also includes a Node.js MCP server in `mcp-server/`. It loads its network and wake-on-LAN settings from `mcp-server/freecycle-mcp.config.json`.
+
+When a local MCP tool is invoked, the server checks Ollama first. If Ollama is not responding and wake-on-LAN is enabled in that config, it sends multiple magic packets to the configured FreeCycle machine, then polls FreeCycle every 30 seconds by default for up to 15 minutes by default. If local inference still does not become available, the MCP tool reports local unavailability so agent workflows can fall back to cloud models.
+
+The long-running local MCP tools, `freecycle_pull_model`, `freecycle_generate`, `freecycle_chat`, `freecycle_embed`, and `freecycle_benchmark`, automatically call `/task/start` and `/task/stop` so the FreeCycle tray reflects active MCP work. The manual MCP task tools remain available for custom workflows that need explicit signaling.
 
 ## Development
 
@@ -164,4 +173,3 @@ cargo run -- -v          # Run with verbose logging
 ## License
 
 Apache 2.0
-

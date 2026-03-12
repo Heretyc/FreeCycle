@@ -1,0 +1,25 @@
+{
+  "freecycle": {
+    "host": "localhost",
+    "port": 7443
+  },
+  "ollama": {
+    "host": "localhost",
+    "port": 11434
+  },
+  "timeouts": {
+    "requestMs": 10000,
+    "inferenceMs": 300000,
+    "pullMs": 600000
+  },
+  "wakeOnLan": {
+    "enabled": false,
+    "macAddress": "",
+    "broadcastAddress": "255.255.255.255",
+    "port": 9,
+    "packetCount": 5,
+    "packetIntervalMs": 250,
+    "pollIntervalMs": 30000,
+    "maxWaitMs": 900000
+  }
+}

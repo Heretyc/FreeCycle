@@ -6,6 +6,19 @@
 
 use std::time::Instant;
 
+/// Manual runtime override applied from the tray menu.
+///
+/// This captures operator intent separately from the observed runtime status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualOverride {
+    /// Keep Ollama runnable until a newly detected blocked condition,
+    /// including post-resume wake delay, clears it.
+    ForceEnable,
+
+    /// Keep Ollama stopped until the next truly available GPU check clears it.
+    ForceDisable,
+}
+
 /// Represents the current operational status of FreeCycle.
 ///
 /// The status determines tray icon color, Ollama process state,
@@ -43,6 +56,13 @@ pub enum FreeCycleStatus {
         expires_at: Instant,
     },
 
+    /// The system recently resumed from sleep or suspend.
+    /// Ollama remains stopped until the wake delay expires.
+    WakeDelay {
+        /// When the post-wake hold will expire.
+        expires_at: Instant,
+    },
+
     /// An external agent has signaled it is actively using the GPU for a task.
     /// Ollama is running. Icon is blue.
     AgentTaskActive,
@@ -67,9 +87,20 @@ impl FreeCycleStatus {
             Self::Available => "Available",
             Self::Blocked => "Blocked (Game Running)",
             Self::Cooldown { .. } => "Cooldown",
+            Self::WakeDelay { .. } => "Wake Delay",
             Self::AgentTaskActive => "Agent Task Active",
             Self::Downloading => "Downloading Models",
             Self::Error(_) => "Error",
+        }
+    }
+}
+
+impl ManualOverride {
+    /// Returns a human-readable label for the active manual override.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ForceEnable => "Force Enable",
+            Self::ForceDisable => "Force Disable",
         }
     }
 }
@@ -117,12 +148,19 @@ mod tests {
             .label(),
             "Cooldown"
         );
-        assert_eq!(FreeCycleStatus::AgentTaskActive.label(), "Agent Task Active");
-        assert_eq!(FreeCycleStatus::Downloading.label(), "Downloading Models");
         assert_eq!(
-            FreeCycleStatus::Error("test".into()).label(),
-            "Error"
+            FreeCycleStatus::WakeDelay {
+                expires_at: Instant::now()
+            }
+            .label(),
+            "Wake Delay"
         );
+        assert_eq!(
+            FreeCycleStatus::AgentTaskActive.label(),
+            "Agent Task Active"
+        );
+        assert_eq!(FreeCycleStatus::Downloading.label(), "Downloading Models");
+        assert_eq!(FreeCycleStatus::Error("test".into()).label(), "Error");
     }
 
     #[test]
@@ -135,5 +173,11 @@ mod tests {
         };
         assert_eq!(task.task_id, "task-001");
         assert_eq!(task.description, "Running inference batch");
+    }
+
+    #[test]
+    fn test_manual_override_labels() {
+        assert_eq!(ManualOverride::ForceEnable.label(), "Force Enable");
+        assert_eq!(ManualOverride::ForceDisable.label(), "Force Disable");
     }
 }

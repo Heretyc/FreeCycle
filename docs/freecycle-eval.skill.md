@@ -12,7 +12,7 @@ When this skill is invoked, you MUST follow the steps below in order. Do NOT ski
 
 ## Phase 1: Discovery (Mandatory)
 
-Before providing any evaluation, you MUST ask the user the following questions. Present all five at once in a numbered list. Wait for their responses before proceeding.
+Before providing any evaluation, you MUST ask the user the following questions. Present all six at once in a numbered list. Wait for their responses before proceeding.
 
 ### Required Questions
 
@@ -50,6 +50,12 @@ What is the acceptable quality tradeoff?
 - (b) Good enough for the task (balanced quality and cost)
 - (c) Speed over quality (fastest response wins)
 
+**Q6. Remote Wake Behavior**
+If the local FreeCycle server is on another machine, should the MCP layer try wake-on-LAN before falling back to cloud?
+- (a) Yes. Wake it automatically and wait up to a configured timeout
+- (b) No. Skip wake-on-LAN and route to cloud immediately when local is down
+- (c) Not applicable. Everything runs on one machine
+
 ### Follow Up Questions
 
 If the user's answers reveal ambiguity or edge cases, ask additional clarifying questions. Examples:
@@ -59,6 +65,7 @@ If the user's answers reveal ambiguity or edge cases, ask additional clarifying 
 - If Q4 is "Some data can go to cloud": Can you describe which data categories are sensitive vs. non sensitive?
 - If Q1 is "Hybrid": Do you have a preference for which tasks go where, or do you want a recommendation?
 - If the user mentions multiple workloads: Which workload is highest priority? Which has the most volume?
+- If Q6 is "Yes": What are the MAC address, broadcast address, poll interval, and maximum wait time for wake-on-LAN?
 
 ---
 
@@ -84,6 +91,7 @@ Adjust scores based on the user's specific answers:
 - If the user runs games frequently, decrease local availability score.
 - If the user's workload is primarily embeddings, increase local quality score (nomic-embed-text is excellent for this).
 - If the user's workload is advanced reasoning or code generation, decrease local quality score and increase cloud quality score.
+- If wake-on-LAN is enabled for a remote FreeCycle host, increase local availability by 1 point when the user's latency requirement can tolerate the wake delay.
 
 ### How to Present the Evaluation
 
@@ -101,7 +109,7 @@ Provide the user with a concrete benchmarking plan tailored to their workload. T
 
 1. **Prepare a test dataset.** Create 20 to 50 representative prompts for the user's workload. Include easy, medium, and hard examples.
 
-2. **Check FreeCycle status.** Before benchmarking, confirm FreeCycle is running and Ollama is available:
+2. **Check FreeCycle status.** Before benchmarking, confirm FreeCycle is running and Ollama is available. If you are going through the MCP server and wake-on-LAN is enabled, the MCP layer can wake the remote FreeCycle machine before the benchmark starts:
 
 ```bash
 curl http://localhost:7443/status
@@ -120,7 +128,7 @@ Expected response when available:
 }
 ```
 
-3. **Signal task start.** Notify FreeCycle that benchmarking is beginning:
+3. **Signal task start when you benchmark Ollama directly.** If you run the shipped MCP `freecycle_benchmark` tool instead, the MCP server already signals task start and stop automatically for the full benchmark run:
 
 ```bash
 curl -X POST http://localhost:7443/task/start \
@@ -144,7 +152,7 @@ time curl -s http://localhost:11434/api/embed \
 
 5. **Run cloud benchmarks** (if applicable). Use the same prompts against Claude or OpenAI APIs. Record latency and response quality.
 
-6. **Signal task stop:**
+6. **Signal task stop for direct HTTP benchmarks:**
 
 ```bash
 curl -X POST http://localhost:7443/task/stop \
@@ -210,10 +218,11 @@ Based on the evaluation, provide specific routing recommendations. Present as a 
 For hybrid deployments, recommend this routing strategy:
 
 1. **Check FreeCycle status first.** If Ollama is not running (game detected, cooldown period), route everything to cloud.
-2. **Classify prompt complexity.** Use a lightweight local classifier or heuristic (prompt length, presence of code blocks, mathematical notation).
-3. **Route simple prompts locally.** If the prompt is under 500 tokens and does not require advanced reasoning, use local.
-4. **Route complex prompts to cloud.** If the prompt requires multi step reasoning, code generation, or long context, use cloud.
-5. **Always route sensitive data locally.** Override all other rules for privacy sensitive content.
+2. **If Ollama is down, decide whether to wake or fall back.** When wake-on-LAN is enabled, send the configured packet burst and poll FreeCycle every 30 seconds by default, for up to the configured max wait. If wake-on-LAN is disabled, route directly to cloud.
+3. **Classify prompt complexity.** Use a lightweight local classifier or heuristic (prompt length, presence of code blocks, mathematical notation).
+4. **Route simple prompts locally.** If the prompt is under 500 tokens and does not require advanced reasoning, use local.
+5. **Route complex prompts to cloud.** If the prompt requires multi step reasoning, code generation, or long context, use cloud.
+6. **Always route sensitive data locally.** Override all other rules for privacy sensitive content unless the user explicitly accepts a cloud fallback when local is offline.
 
 ---
 
@@ -241,7 +250,8 @@ def generate(prompt, prefer_local=True):
     ollama_available, status = get_freecycle_status()
 
     if prefer_local and ollama_available:
-        # Signal task start
+        # Direct HTTP integrations should signal task start and stop themselves.
+        # The shipped MCP local execution tools already do this automatically.
         requests.post(f"{FREECYCLE_URL}/task/start", json={
             "task_id": "agent-gen-001",
             "description": "Generating response"
@@ -274,12 +284,34 @@ To use FreeCycle as an MCP server in Claude Code, add this to your MCP settings:
       "command": "npx",
       "args": ["-y", "freecycle-mcp-server"],
       "env": {
-        "FREECYCLE_HOST": "localhost",
-        "FREECYCLE_PORT": "7443",
-        "OLLAMA_HOST": "localhost",
-        "OLLAMA_PORT": "11434"
+        "FREECYCLE_MCP_CONFIG": "C:/path/to/freecycle/mcp-server/freecycle-mcp.config.json"
       }
     }
+  }
+}
+```
+
+Example `freecycle-mcp.config.json` for a remote FreeCycle host with wake-on-LAN:
+
+```json
+{
+  "freecycle": {
+    "host": "192.168.1.10",
+    "port": 7443
+  },
+  "ollama": {
+    "host": "192.168.1.10",
+    "port": 11434
+  },
+  "wakeOnLan": {
+    "enabled": true,
+    "macAddress": "AA:BB:CC:DD:EE:FF",
+    "broadcastAddress": "192.168.1.255",
+    "port": 9,
+    "packetCount": 5,
+    "packetIntervalMs": 250,
+    "pollIntervalMs": 30000,
+    "maxWaitMs": 900000
   }
 }
 ```
@@ -406,15 +438,20 @@ class FreeCycleAgent:
 1. **Never send sensitive data to cloud APIs.** If the user indicated privacy requirements (Q4=a), all processing must stay local regardless of quality tradeoff.
 2. **Never assume FreeCycle/Ollama is available.** Always check `/status` before routing to local. A game may have started since your last check.
 3. **Never ignore the cooldown period.** When FreeCycle reports "Cooldown" status, Ollama is stopped. Do not attempt to connect to Ollama during cooldown (default: 1800 seconds after a game exits).
-4. **Never run benchmarks during gaming sessions.** Check status first. If blocked, wait or use cloud only.
-5. **Never hardcode model names without fallback.** Models may change. Always have a fallback model or routing path.
-6. **Never skip the task signal endpoints.** Always call `/task/start` and `/task/stop` so FreeCycle can track GPU usage and adjust the tray icon state.
+4. **Never ignore the wake delay.** When FreeCycle reports "Wake Delay" status after resume, Ollama is stopped for the configured hold period (default: 60 seconds) unless the user manually forces it on.
+5. **Never run benchmarks during gaming sessions.** Check status first. If blocked, wait or use cloud only.
+6. **Never wait forever for a sleeping server.** If wake-on-LAN is enabled, use a bounded max wait and then route to cloud.
+7. **Never hardcode model names without fallback.** Models may change. Always have a fallback model or routing path.
+8. **Never skip task signaling.** The shipped MCP local execution tools already wrap their work with `/task/start` and `/task/stop`. For direct HTTP or custom local workflows, add the same start and stop calls yourself and guarantee cleanup in `finally`.
 
 ### Edge Cases
 
 | Scenario | How to Handle |
 |---|---|
 | FreeCycle is unreachable (service not running) | Fall back to cloud. Log a warning. Retry FreeCycle status on next request. |
+| FreeCycle machine is asleep and wake-on-LAN is enabled | Send the configured burst of magic packets, then poll FreeCycle every 30 seconds by default until it is ready or the max wait expires. |
+| FreeCycle machine is asleep and wake-on-LAN is disabled | Report local as unavailable immediately and route to cloud. |
+| FreeCycle reports "Wake Delay" status | Wait for the short post resume hold to expire, or route temporarily to cloud if latency matters. |
 | Ollama is running but model is not loaded | First request will be slow (model load time). Set a longer timeout (60s+) for the first request. |
 | Game starts mid inference | FreeCycle will stop Ollama. Your request will fail. Catch the error and retry via cloud. |
 | VRAM is nearly full | Check `vram_percent` in status response. If over 80%, consider routing to cloud to avoid OOM. |
@@ -461,7 +498,7 @@ Present your final recommendation in this structure:
 This section verifies the skill is complete and production ready. Each "personality" checks a different quality dimension.
 
 ### 1. Clarity Auditor
-- Are the five discovery questions unambiguous? **Yes.** Each question provides explicit multiple choice options with clear distinctions.
+- Are the discovery questions unambiguous? **Yes.** Each question provides explicit multiple choice options with clear distinctions.
 - Is the evaluation framework clear? **Yes.** Scoring dimensions are defined with 1 to 5 numeric scales and explanations for each score range.
 - Could a user misinterpret any instruction? **Mitigated.** Follow up questions handle ambiguous answers. The routing table provides explicit mappings.
 
@@ -481,9 +518,9 @@ This section verifies the skill is complete and production ready. Each "personal
 - Are the examples realistic? **Yes.** They use actual model names (llama3.1:8b-instruct-q4_K_M, nomic-embed-text), actual endpoints (/status, /task/start, /task/stop), and actual ports (7443, 11434).
 
 ### 5. Negative Constraints Guardian
-- Does the skill specify what NOT to do? **Yes.** Phase 6 lists six explicit prohibitions with explanations.
+- Does the skill specify what NOT to do? **Yes.** Phase 6 lists eight explicit prohibitions with explanations.
 - Is the "never send sensitive data to cloud" rule enforced? **Yes.** It is the highest priority routing rule and is repeated in multiple sections.
-- Are failure modes addressed? **Yes.** The edge cases table covers seven scenarios with specific handling instructions.
+- Are failure modes addressed? **Yes.** The edge cases table covers the main wake, availability, and runtime failure scenarios with specific handling instructions.
 
 ### 6. Reasoning Validator
 - Does it walk through the decision tree step by step? **Yes.** The dynamic routing logic in Phase 4 is a numbered step by step process.

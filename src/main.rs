@@ -49,11 +49,17 @@ pub struct AppState {
     /// Information about the currently active agent task, if any.
     pub agent_task: Option<state::AgentTask>,
 
+    /// Current in-memory operator override from the tray menu.
+    pub manual_override: Option<state::ManualOverride>,
+
     /// Timestamp when a blacklisted process was last detected.
     pub last_blacklist_seen: Option<std::time::Instant>,
 
     /// Timestamp when VRAM usage last dropped below the idle threshold (300MB).
     pub vram_idle_since: Option<std::time::Instant>,
+
+    /// Deadline until which Ollama stays stopped after system resume.
+    pub wake_block_until: Option<std::time::Instant>,
 
     /// Whether Ollama is currently running.
     pub ollama_running: bool,
@@ -96,8 +102,10 @@ impl AppState {
             status: state::FreeCycleStatus::Initializing,
             config,
             agent_task: None,
+            manual_override: None,
             last_blacklist_seen: None,
             vram_idle_since: None,
+            wake_block_until: None,
             ollama_running: false,
             vram_used_bytes: 0,
             vram_total_bytes: 0,
@@ -113,14 +121,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging (verbose writes to ~/freecycle-verbose.log)
-    let _guard = logging::init_logging(cli.verbose)
-        .context("Failed to initialize logging")?;
+    let _guard = logging::init_logging(cli.verbose).context("Failed to initialize logging")?;
 
     info!("FreeCycle v{} starting", env!("CARGO_PKG_VERSION"));
 
     // Check for existing instance via lockfile
-    let lock = lockfile::ProcessLock::acquire()
-        .context("Failed to check process lock")?;
+    let lock = lockfile::ProcessLock::acquire().context("Failed to check process lock")?;
     if lock.is_none() {
         info!("Another instance of FreeCycle is already running. Exiting quietly.");
         return Ok(());
@@ -131,7 +137,10 @@ fn main() -> Result<()> {
     // Load configuration
     let config = config::FreeCycleConfig::load_or_create_default()
         .context("Failed to load configuration")?;
-    info!("Configuration loaded from {}", config::config_path().display());
+    info!(
+        "Configuration loaded from {}",
+        config::config_path().display()
+    );
 
     // Disable Ollama auto-start (registry Run key and scheduled tasks)
     if let Err(e) = autostart::disable_ollama_autostart() {
@@ -152,8 +161,7 @@ fn main() -> Result<()> {
     }
 
     // Build the async runtime
-    let runtime = tokio::runtime::Runtime::new()
-        .context("Failed to create Tokio runtime")?;
+    let runtime = tokio::runtime::Runtime::new().context("Failed to create Tokio runtime")?;
 
     // Create shared state
     let shared_state = Arc::new(RwLock::new(AppState::new(config)));

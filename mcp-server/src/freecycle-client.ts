@@ -5,6 +5,8 @@
  * Uses native fetch (Node 18+). All methods accept an optional baseUrl override.
  */
 
+import { getConfig } from "./config.js";
+
 /** Shape returned by GET /status. */
 export interface FreeCycleStatus {
   status: string;
@@ -26,15 +28,37 @@ export interface ApiResponse {
   message: string;
 }
 
-function resolveBase(): string {
-  const host = process.env.FREECYCLE_HOST ?? "localhost";
-  const port = process.env.FREECYCLE_PORT ?? "7443";
-  return `http://${host}:${port}`;
+export interface JsonHttpResponse<T> {
+  status: number;
+  ok: boolean;
+  body: T;
 }
 
-async function request<T>(url: string, init?: RequestInit): Promise<T> {
+export function resolveBase(): string {
+  const config = getConfig();
+  return `http://${config.freecycle.host}:${config.freecycle.port}`;
+}
+
+function extractResponseMessage(parsed: unknown, fallback: string): string {
+  if (typeof parsed !== "object" || parsed == null) {
+    return fallback;
+  }
+
+  const candidate = (parsed as Record<string, unknown>).message;
+  if (typeof candidate === "string" && candidate.trim() !== "") {
+    return candidate;
+  }
+
+  return fallback;
+}
+
+async function requestResponse<T>(
+  url: string,
+  init?: RequestInit,
+  timeoutMs = getConfig().timeouts.requestMs,
+): Promise<JsonHttpResponse<T>> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, { ...init, signal: controller.signal });
     const body = await res.text();
@@ -44,19 +68,38 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     } catch {
       throw new Error(`Non-JSON response from ${url}: ${body.slice(0, 200)}`);
     }
-    if (!res.ok) {
-      const msg = (parsed as Record<string, unknown>)?.message ?? body.slice(0, 200);
-      throw new Error(`HTTP ${res.status} from ${url}: ${msg}`);
-    }
-    return parsed;
+    return {
+      status: res.status,
+      ok: res.ok,
+      body: parsed,
+    };
   } catch (err: unknown) {
     if (err instanceof DOMException && err.name === "AbortError") {
-      throw new Error(`Request to ${url} timed out after 10 seconds`);
+      throw new Error(
+        `Request to ${url} timed out after ${Math.round(timeoutMs / 1000)} seconds`,
+      );
     }
     throw err;
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function request<T>(
+  url: string,
+  init?: RequestInit,
+  timeoutMs = getConfig().timeouts.requestMs,
+): Promise<T> {
+  const response = await requestResponse<T>(url, init, timeoutMs);
+  if (!response.ok) {
+    const message = extractResponseMessage(
+      response.body,
+      JSON.stringify(response.body).slice(0, 200),
+    );
+    throw new Error(`HTTP ${response.status} from ${url}: ${message}`);
+  }
+
+  return response.body;
 }
 
 /** Fetch the full FreeCycle status (GPU, VRAM, Ollama, active tasks, network). */
@@ -71,8 +114,24 @@ export async function startTask(
   description: string,
   baseUrl?: string,
 ): Promise<ApiResponse> {
+  const response = await startTaskDetailed(taskId, description, baseUrl);
+  if (!response.ok) {
+    throw new Error(
+      `HTTP ${response.status} from ${(baseUrl ?? resolveBase())}/task/start: ${response.body.message}`,
+    );
+  }
+
+  return response.body;
+}
+
+/** Signal that an agentic workflow is beginning GPU work and inspect the HTTP status. */
+export async function startTaskDetailed(
+  taskId: string,
+  description: string,
+  baseUrl?: string,
+): Promise<JsonHttpResponse<ApiResponse>> {
   const base = baseUrl ?? resolveBase();
-  return request<ApiResponse>(`${base}/task/start`, {
+  return requestResponse<ApiResponse>(`${base}/task/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ task_id: taskId, description }),
@@ -84,8 +143,23 @@ export async function stopTask(
   taskId: string,
   baseUrl?: string,
 ): Promise<ApiResponse> {
+  const response = await stopTaskDetailed(taskId, baseUrl);
+  if (!response.ok) {
+    throw new Error(
+      `HTTP ${response.status} from ${(baseUrl ?? resolveBase())}/task/stop: ${response.body.message}`,
+    );
+  }
+
+  return response.body;
+}
+
+/** Signal that an agentic workflow has finished GPU work and inspect the HTTP status. */
+export async function stopTaskDetailed(
+  taskId: string,
+  baseUrl?: string,
+): Promise<JsonHttpResponse<ApiResponse>> {
   const base = baseUrl ?? resolveBase();
-  return request<ApiResponse>(`${base}/task/stop`, {
+  return requestResponse<ApiResponse>(`${base}/task/stop`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ task_id: taskId }),

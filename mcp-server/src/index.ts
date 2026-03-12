@@ -7,8 +7,9 @@
  * as MCP tools for Claude Code, OpenAI Codex, or any MCP compatible client.
  *
  * Transport: stdio
- * Default ports: FreeCycle 7443, Ollama 11434
- * Override via env: FREECYCLE_HOST, FREECYCLE_PORT, OLLAMA_HOST, OLLAMA_PORT
+ * Runtime config: ../freecycle-mcp.config.json by default
+ * Optional env overrides: FREECYCLE_MCP_CONFIG, FREECYCLE_HOST, FREECYCLE_PORT,
+ * OLLAMA_HOST, OLLAMA_PORT, and FREECYCLE_WOL_*
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";

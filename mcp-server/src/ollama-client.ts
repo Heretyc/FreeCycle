@@ -6,6 +6,8 @@
  * Generate and chat requests use a 5 minute timeout. All others use 30 seconds.
  */
 
+import { getConfig } from "./config.js";
+
 export interface GenerateRequest {
   model: string;
   prompt: string;
@@ -93,16 +95,15 @@ export interface PullResponse {
   completed?: number;
 }
 
-function resolveBase(): string {
-  const host = process.env.OLLAMA_HOST ?? "localhost";
-  const port = process.env.OLLAMA_PORT ?? "11434";
-  return `http://${host}:${port}`;
+export function resolveBase(): string {
+  const config = getConfig();
+  return `http://${config.ollama.host}:${config.ollama.port}`;
 }
 
-async function request<T>(
+async function requestJson<T>(
   url: string,
   init?: RequestInit,
-  timeoutMs = 30_000,
+  timeoutMs = getConfig().timeouts.requestMs,
 ): Promise<T> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -132,7 +133,43 @@ async function request<T>(
   }
 }
 
-const INFERENCE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+async function requestText(
+  url: string,
+  init?: RequestInit,
+  timeoutMs = getConfig().timeouts.requestMs,
+): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    const body = await res.text();
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} from ${url}: ${body.slice(0, 300)}`);
+    }
+
+    return body;
+  } catch (err: unknown) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error(
+        `Request to ${url} timed out after ${Math.round(timeoutMs / 1000)} seconds`,
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** Quick connectivity check against GET /. */
+export async function healthCheck(baseUrl?: string): Promise<string> {
+  const base = baseUrl ?? resolveBase();
+  const response = await requestText(`${base}/`);
+  if (!response.toLowerCase().includes("ollama")) {
+    throw new Error(`Unexpected health response from ${base}/: ${response.slice(0, 200)}`);
+  }
+
+  return response;
+}
 
 /** Send a text generation request (non-streaming). */
 export async function generate(
@@ -152,14 +189,14 @@ export async function generate(
       ...(options?.num_predict != null ? { num_predict: options.num_predict } : {}),
     },
   };
-  return request<GenerateResponse>(
+  return requestJson<GenerateResponse>(
     `${base}/api/generate`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     },
-    INFERENCE_TIMEOUT,
+    getConfig().timeouts.inferenceMs,
   );
 }
 
@@ -185,14 +222,14 @@ export async function chat(
       ...(options?.num_predict != null ? { num_predict: options.num_predict } : {}),
     },
   };
-  return request<ChatResponse>(
+  return requestJson<ChatResponse>(
     `${base}/api/chat`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     },
-    INFERENCE_TIMEOUT,
+    getConfig().timeouts.inferenceMs,
   );
 }
 
@@ -204,21 +241,21 @@ export async function embed(
 ): Promise<EmbedResponse> {
   const base = baseUrl ?? resolveBase();
   const body: EmbedRequest = { model, input };
-  return request<EmbedResponse>(
+  return requestJson<EmbedResponse>(
     `${base}/api/embed`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     },
-    INFERENCE_TIMEOUT,
+    getConfig().timeouts.inferenceMs,
   );
 }
 
 /** List all locally available models. */
 export async function listModels(baseUrl?: string): Promise<ListModelsResponse> {
   const base = baseUrl ?? resolveBase();
-  return request<ListModelsResponse>(`${base}/api/tags`);
+  return requestJson<ListModelsResponse>(`${base}/api/tags`);
 }
 
 /** Get detailed information about a specific model. */
@@ -227,7 +264,7 @@ export async function showModel(
   baseUrl?: string,
 ): Promise<ShowModelResponse> {
   const base = baseUrl ?? resolveBase();
-  return request<ShowModelResponse>(`${base}/api/show`, {
+  return requestJson<ShowModelResponse>(`${base}/api/show`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
@@ -240,13 +277,13 @@ export async function pullModel(
   baseUrl?: string,
 ): Promise<PullResponse> {
   const base = baseUrl ?? resolveBase();
-  return request<PullResponse>(
+  return requestJson<PullResponse>(
     `${base}/api/pull`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, stream: false }),
     },
-    10 * 60 * 1000, // 10 minute timeout for large model downloads
+    getConfig().timeouts.pullMs,
   );
 }

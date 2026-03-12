@@ -4,7 +4,7 @@
 //! non-whitelisted VRAM usage above the configured threshold. Updates
 //! the shared application state to drive Ollama lifecycle decisions.
 
-use crate::state::FreeCycleStatus;
+use crate::state::{FreeCycleStatus, ManualOverride};
 use crate::AppState;
 use nvml_wrapper::Nvml;
 use std::collections::HashMap;
@@ -24,10 +24,7 @@ use tracing::{debug, error, info, warn};
 ///
 /// * `state` - Shared application state.
 /// * `shutdown_rx` - Watch channel that signals when the application is shutting down.
-pub async fn run_gpu_monitor(
-    state: Arc<RwLock<AppState>>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
+pub async fn run_gpu_monitor(state: Arc<RwLock<AppState>>, mut shutdown_rx: watch::Receiver<bool>) {
     let nvml = match Nvml::init() {
         Ok(nvml) => nvml,
         Err(e) => {
@@ -132,44 +129,26 @@ pub async fn run_gpu_monitor(
 
         // State machine transitions
         let now = Instant::now();
-
-        if !blacklisted_detected.is_empty() {
-            // Blacklisted process running: block immediately
-            s.last_blacklist_seen = Some(now);
-            if s.status != FreeCycleStatus::Blocked {
-                info!(
-                    "Blacklisted process detected: {:?}. Blocking GPU access.",
-                    blacklisted_detected
-                );
-            }
-            s.status = FreeCycleStatus::Blocked;
-            s.agent_task = None;
-        } else if let Some(last_seen) = s.last_blacklist_seen {
-            let cooldown = Duration::from_secs(s.config.general.cooldown_seconds);
-            let elapsed = now.duration_since(last_seen);
-            if elapsed < cooldown {
-                let expires_at = last_seen + cooldown;
-                debug!(
-                    "Cooldown active: {} seconds remaining",
-                    (cooldown - elapsed).as_secs()
-                );
-                s.status = FreeCycleStatus::Cooldown { expires_at };
-            } else {
-                // Cooldown expired
-                s.last_blacklist_seen = None;
-                transition_to_available_or_agent(&mut s, high_vram_usage);
-            }
-        } else if high_vram_usage {
-            // Non-whitelisted process using too much VRAM
-            debug!(
-                "High VRAM usage from non-whitelisted processes: {} MB / {} MB threshold",
-                non_whitelisted_vram / (1024 * 1024),
-                vram_threshold_bytes / (1024 * 1024)
-            );
-            s.status = FreeCycleStatus::Blocked;
-        } else {
-            transition_to_available_or_agent(&mut s, high_vram_usage);
-        }
+        let previous_raw_blocked = is_raw_blocked(&s.status);
+        let raw_status = compute_raw_gpu_status(
+            &mut s,
+            &blacklisted_detected,
+            high_vram_usage,
+            non_whitelisted_vram,
+            vram_threshold_bytes,
+            now,
+        );
+        let raw_blocked = is_raw_blocked(&raw_status);
+        let resolved_status = apply_manual_override(
+            &raw_status,
+            s.manual_override,
+            s.agent_task.is_some(),
+            s.models_downloading,
+            previous_raw_blocked,
+            raw_blocked,
+        );
+        s.status = resolved_status.status;
+        s.manual_override = resolved_status.cleared_override;
 
         // Check agent task timeout
         check_agent_task_timeout(&mut s);
@@ -183,16 +162,132 @@ pub async fn run_gpu_monitor(
 ///
 /// * `s` - Mutable reference to the app state.
 /// * `high_vram_usage` - Whether non-whitelisted VRAM usage is above threshold.
-fn transition_to_available_or_agent(
-    s: &mut AppState,
-    _high_vram_usage: bool,
-) {
+fn transition_to_available_or_agent(s: &mut AppState) -> FreeCycleStatus {
     if s.agent_task.is_some() {
-        s.status = FreeCycleStatus::AgentTaskActive;
+        FreeCycleStatus::AgentTaskActive
     } else if s.models_downloading {
-        s.status = FreeCycleStatus::Downloading;
+        FreeCycleStatus::Downloading
     } else {
-        s.status = FreeCycleStatus::Available;
+        FreeCycleStatus::Available
+    }
+}
+
+fn compute_raw_gpu_status(
+    s: &mut AppState,
+    blacklisted_detected: &[String],
+    high_vram_usage: bool,
+    non_whitelisted_vram: u64,
+    vram_threshold_bytes: u64,
+    now: Instant,
+) -> FreeCycleStatus {
+    if !blacklisted_detected.is_empty() {
+        s.last_blacklist_seen = Some(now);
+        if s.status != FreeCycleStatus::Blocked {
+            info!(
+                "Blacklisted process detected: {:?}. Blocking GPU access.",
+                blacklisted_detected
+            );
+        }
+        s.agent_task = None;
+        return FreeCycleStatus::Blocked;
+    }
+
+    if let Some(last_seen) = s.last_blacklist_seen {
+        let cooldown = Duration::from_secs(s.config.general.cooldown_seconds);
+        let elapsed = now.duration_since(last_seen);
+        if elapsed < cooldown {
+            let expires_at = last_seen + cooldown;
+            debug!(
+                "Cooldown active: {} seconds remaining",
+                (cooldown - elapsed).as_secs()
+            );
+            return FreeCycleStatus::Cooldown { expires_at };
+        }
+
+        s.last_blacklist_seen = None;
+    }
+
+    if let Some(wake_block_until) = s.wake_block_until {
+        if now < wake_block_until {
+            let remaining = wake_block_until.saturating_duration_since(now);
+            debug!(
+                "Wake delay active: {} seconds remaining",
+                remaining.as_secs()
+            );
+            return FreeCycleStatus::WakeDelay {
+                expires_at: wake_block_until,
+            };
+        }
+
+        s.wake_block_until = None;
+    }
+
+    if high_vram_usage {
+        debug!(
+            "High VRAM usage from non-whitelisted processes: {} MB / {} MB threshold",
+            non_whitelisted_vram / (1024 * 1024),
+            vram_threshold_bytes / (1024 * 1024)
+        );
+        return FreeCycleStatus::Blocked;
+    }
+
+    transition_to_available_or_agent(s)
+}
+
+fn is_raw_blocked(status: &FreeCycleStatus) -> bool {
+    matches!(
+        status,
+        FreeCycleStatus::Blocked
+            | FreeCycleStatus::Cooldown { .. }
+            | FreeCycleStatus::WakeDelay { .. }
+    )
+}
+
+#[derive(Debug)]
+struct OverrideResolution {
+    status: FreeCycleStatus,
+    cleared_override: Option<ManualOverride>,
+}
+
+fn apply_manual_override(
+    raw_status: &FreeCycleStatus,
+    manual_override: Option<ManualOverride>,
+    agent_task_active: bool,
+    models_downloading: bool,
+    previous_raw_blocked: bool,
+    raw_blocked: bool,
+) -> OverrideResolution {
+    match manual_override {
+        Some(ManualOverride::ForceEnable) if raw_blocked && !previous_raw_blocked => {
+            OverrideResolution {
+                status: raw_status.clone(),
+                cleared_override: None,
+            }
+        }
+        Some(ManualOverride::ForceEnable) => OverrideResolution {
+            status: if agent_task_active {
+                FreeCycleStatus::AgentTaskActive
+            } else if models_downloading {
+                FreeCycleStatus::Downloading
+            } else {
+                FreeCycleStatus::Available
+            },
+            cleared_override: manual_override,
+        },
+        Some(ManualOverride::ForceDisable) if matches!(raw_status, FreeCycleStatus::Available) => {
+            OverrideResolution {
+                status: FreeCycleStatus::Available,
+                cleared_override: None,
+            }
+        }
+        Some(ManualOverride::ForceDisable) => OverrideResolution {
+            status: raw_status.clone(),
+            cleared_override: manual_override,
+        },
+        None => OverrideResolution {
+            status: raw_status.clone(),
+            cleared_override: None,
+        },
     }
 }
 
@@ -303,6 +398,20 @@ fn calculate_non_whitelisted_vram(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::AgentTask;
+
+    fn test_state() -> AppState {
+        AppState::new(crate::config::FreeCycleConfig::default())
+    }
+
+    fn test_agent_task(started_at: Instant) -> AgentTask {
+        AgentTask {
+            task_id: "task-1".to_string(),
+            description: "Indexing repository".to_string(),
+            started_at,
+            source_ip: "127.0.0.1".to_string(),
+        }
+    }
 
     #[test]
     fn test_find_blacklisted_processes_empty() {
@@ -330,5 +439,269 @@ mod tests {
         let blacklist = vec!["VRChat.exe".to_string()];
         let found = find_blacklisted_processes(&map, &blacklist);
         assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn test_force_enable_clears_on_new_block() {
+        let resolution = apply_manual_override(
+            &FreeCycleStatus::Blocked,
+            Some(ManualOverride::ForceEnable),
+            false,
+            false,
+            false,
+            true,
+        );
+        assert_eq!(resolution.status, FreeCycleStatus::Blocked);
+        assert_eq!(resolution.cleared_override, None);
+    }
+
+    #[test]
+    fn test_force_enable_holds_available_until_new_block() {
+        let resolution = apply_manual_override(
+            &FreeCycleStatus::Cooldown {
+                expires_at: Instant::now(),
+            },
+            Some(ManualOverride::ForceEnable),
+            false,
+            false,
+            true,
+            true,
+        );
+        assert_eq!(resolution.status, FreeCycleStatus::Available);
+        assert_eq!(
+            resolution.cleared_override,
+            Some(ManualOverride::ForceEnable)
+        );
+    }
+
+    #[test]
+    fn test_force_enable_clears_on_new_wake_delay() {
+        let resolution = apply_manual_override(
+            &FreeCycleStatus::WakeDelay {
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+            Some(ManualOverride::ForceEnable),
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(matches!(
+            resolution.status,
+            FreeCycleStatus::WakeDelay { .. }
+        ));
+        assert_eq!(resolution.cleared_override, None);
+    }
+
+    #[test]
+    fn test_force_disable_clears_on_true_availability() {
+        let resolution = apply_manual_override(
+            &FreeCycleStatus::Available,
+            Some(ManualOverride::ForceDisable),
+            false,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(resolution.status, FreeCycleStatus::Available);
+        assert_eq!(resolution.cleared_override, None);
+    }
+
+    #[test]
+    fn test_force_disable_preserves_blocked_state_until_available() {
+        let resolution = apply_manual_override(
+            &FreeCycleStatus::Cooldown {
+                expires_at: Instant::now(),
+            },
+            Some(ManualOverride::ForceDisable),
+            false,
+            false,
+            true,
+            true,
+        );
+        assert!(matches!(
+            resolution.status,
+            FreeCycleStatus::Cooldown { .. }
+        ));
+        assert_eq!(
+            resolution.cleared_override,
+            Some(ManualOverride::ForceDisable)
+        );
+    }
+
+    #[test]
+    fn test_compute_raw_gpu_status_blacklist_blocks_sets_timestamp_and_clears_task() {
+        let now = Instant::now();
+        let mut state = test_state();
+        state.agent_task = Some(test_agent_task(now - Duration::from_secs(5)));
+        state.models_downloading = true;
+        state.wake_block_until = Some(now + Duration::from_secs(30));
+
+        let status = compute_raw_gpu_status(
+            &mut state,
+            &[String::from("VRChat.exe")],
+            true,
+            2048,
+            1024,
+            now,
+        );
+
+        assert_eq!(status, FreeCycleStatus::Blocked);
+        assert_eq!(state.last_blacklist_seen, Some(now));
+        assert!(state.agent_task.is_none());
+    }
+
+    #[test]
+    fn test_compute_raw_gpu_status_returns_cooldown_after_blacklist_exits() {
+        let now = Instant::now();
+        let mut state = test_state();
+        let last_seen = now - Duration::from_secs(15);
+        let cooldown = Duration::from_secs(state.config.general.cooldown_seconds);
+        state.last_blacklist_seen = Some(last_seen);
+        state.agent_task = Some(test_agent_task(now - Duration::from_secs(30)));
+
+        let status = compute_raw_gpu_status(&mut state, &[], true, 2048, 1024, now);
+
+        assert_eq!(
+            status,
+            FreeCycleStatus::Cooldown {
+                expires_at: last_seen + cooldown,
+            }
+        );
+        assert_eq!(state.last_blacklist_seen, Some(last_seen));
+        assert!(state.agent_task.is_some());
+    }
+
+    #[test]
+    fn test_compute_raw_gpu_status_clears_expired_cooldown_timestamp() {
+        let now = Instant::now();
+        let mut state = test_state();
+        state.last_blacklist_seen = Some(
+            now - Duration::from_secs(state.config.general.cooldown_seconds + 1),
+        );
+
+        let status = compute_raw_gpu_status(&mut state, &[], false, 0, 1024, now);
+
+        assert_eq!(status, FreeCycleStatus::Available);
+        assert!(state.last_blacklist_seen.is_none());
+    }
+
+    #[test]
+    fn test_compute_raw_gpu_status_vram_only_block_preserves_agent_tracking() {
+        let now = Instant::now();
+        let mut state = test_state();
+        state.agent_task = Some(test_agent_task(now - Duration::from_secs(5)));
+
+        let status = compute_raw_gpu_status(&mut state, &[], true, 2048, 1024, now);
+
+        assert_eq!(status, FreeCycleStatus::Blocked);
+        assert!(state.last_blacklist_seen.is_none());
+        assert!(state.agent_task.is_some());
+    }
+
+    #[test]
+    fn test_transition_to_available_or_agent_prefers_task_then_downloading_then_available() {
+        let now = Instant::now();
+        let mut state = test_state();
+
+        assert_eq!(
+            transition_to_available_or_agent(&mut state),
+            FreeCycleStatus::Available
+        );
+
+        state.models_downloading = true;
+        assert_eq!(
+            transition_to_available_or_agent(&mut state),
+            FreeCycleStatus::Downloading
+        );
+
+        state.agent_task = Some(test_agent_task(now - Duration::from_secs(5)));
+        assert_eq!(
+            transition_to_available_or_agent(&mut state),
+            FreeCycleStatus::AgentTaskActive
+        );
+    }
+
+    #[test]
+    fn test_compute_raw_gpu_status_returns_wake_delay_before_vram_block() {
+        let now = Instant::now();
+        let mut state = test_state();
+        let wake_until = now + Duration::from_secs(30);
+        state.wake_block_until = Some(wake_until);
+
+        let status = compute_raw_gpu_status(&mut state, &[], true, 1024, 512, now);
+
+        assert_eq!(
+            status,
+            FreeCycleStatus::WakeDelay {
+                expires_at: wake_until,
+            }
+        );
+    }
+
+    #[test]
+    fn test_compute_raw_gpu_status_clears_expired_wake_delay() {
+        let now = Instant::now();
+        let mut state = test_state();
+        state.wake_block_until = Some(now - Duration::from_secs(1));
+
+        let status = compute_raw_gpu_status(&mut state, &[], false, 0, 1024, now);
+
+        assert_eq!(status, FreeCycleStatus::Available);
+        assert!(state.wake_block_until.is_none());
+    }
+
+    #[test]
+    fn test_compute_raw_gpu_status_priority_order_matches_blocking_rules() {
+        let now = Instant::now();
+        let mut state = test_state();
+        state.models_downloading = true;
+        state.agent_task = Some(test_agent_task(now - Duration::from_secs(60)));
+        state.last_blacklist_seen = Some(now - Duration::from_secs(1));
+        state.wake_block_until = Some(now + Duration::from_secs(30));
+
+        let blacklist_status = compute_raw_gpu_status(
+            &mut state,
+            &[String::from("VRChat.exe")],
+            true,
+            4096,
+            2048,
+            now,
+        );
+        assert_eq!(blacklist_status, FreeCycleStatus::Blocked);
+        assert!(state.agent_task.is_none());
+
+        state.agent_task = Some(test_agent_task(now - Duration::from_secs(60)));
+        let cooldown_started = state.last_blacklist_seen.unwrap();
+        let cooldown_status = compute_raw_gpu_status(&mut state, &[], true, 4096, 2048, now);
+        assert_eq!(
+            cooldown_status,
+            FreeCycleStatus::Cooldown {
+                expires_at: cooldown_started
+                    + Duration::from_secs(state.config.general.cooldown_seconds),
+            }
+        );
+
+        state.last_blacklist_seen = Some(
+            now - Duration::from_secs(state.config.general.cooldown_seconds + 1),
+        );
+        let wake_until = state.wake_block_until.unwrap();
+        let wake_status = compute_raw_gpu_status(&mut state, &[], true, 4096, 2048, now);
+        assert_eq!(
+            wake_status,
+            FreeCycleStatus::WakeDelay {
+                expires_at: wake_until,
+            }
+        );
+        assert!(state.last_blacklist_seen.is_none());
+
+        state.wake_block_until = Some(now - Duration::from_secs(1));
+        let vram_status = compute_raw_gpu_status(&mut state, &[], true, 4096, 2048, now);
+        assert_eq!(vram_status, FreeCycleStatus::Blocked);
+        assert!(state.wake_block_until.is_none());
+        assert!(state.agent_task.is_some());
+
+        let overlay_status = compute_raw_gpu_status(&mut state, &[], false, 0, 2048, now);
+        assert_eq!(overlay_status, FreeCycleStatus::AgentTaskActive);
     }
 }

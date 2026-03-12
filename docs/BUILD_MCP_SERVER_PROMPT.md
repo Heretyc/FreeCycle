@@ -55,6 +55,8 @@ What are the FreeCycle host IP and port numbers?
 - Ollama API: default is `localhost:11434`
 - Is the MCP server running on the same machine as FreeCycle, or on a remote machine?
 - If remote, what is the FreeCycle machine's LAN IP?
+- If remote, should the MCP server support wake-on-LAN before local tools run?
+- If wake-on-LAN is required, what are the server MAC address, broadcast address, UDP port, packet count, poll interval, and maximum wait time before falling back to cloud?
 
 **Q4: Additional Tools**
 Beyond the standard tool set (listed in Section 4), do you need any of these?
@@ -96,11 +98,14 @@ Base URL: `http://{FREECYCLE_HOST}:{AGENT_PORT}` (default: `http://localhost:744
 
 #### GET /health
 
-Simple uptime check. Returns plain text, not JSON.
+Simple uptime check.
 
 **Response (200 OK):**
-```
-ok
+```json
+{
+  "ok": true,
+  "message": "FreeCycle is running"
+}
 ```
 
 #### GET /status
@@ -110,20 +115,20 @@ Returns the full system state as JSON.
 **Response (200 OK):**
 ```json
 {
-  "status": "available",
+  "status": "Available",
   "ollama_running": true,
   "vram_used_mb": 1024,
   "vram_total_mb": 8192,
-  "vram_percent": 12.5,
+  "vram_percent": 12,
   "active_task_id": null,
   "active_task_description": null,
   "local_ip": "192.168.1.10",
   "ollama_port": 11434,
   "blocking_processes": [],
-  "model_status": {
-    "llama3.1:8b-instruct-q4_K_M": "ready",
-    "nomic-embed-text": "ready"
-  }
+  "model_status": [
+    "ready: llama3.1:8b-instruct-q4_K_M",
+    "ready: nomic-embed-text"
+  ]
 }
 ```
 
@@ -131,26 +136,29 @@ Returns the full system state as JSON.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| status | string | One of: `"available"`, `"blocked_by_process"`, `"blocked_by_cooldown"`, `"blocked_by_vram"`, `"error"` |
+| status | string | Current display label from FreeCycle, for example `"Available"`, `"Blocked (Game Running)"`, `"Cooldown"`, `"Wake Delay"`, `"Agent Task Active"`, `"Downloading Models"`, `"Initializing"`, or `"Error"` |
 | ollama_running | boolean | Whether Ollama process is alive and healthy |
 | vram_used_mb | number | Total VRAM in use across all processes (MB) |
 | vram_total_mb | number | Total GPU VRAM capacity (MB) |
-| vram_percent | number | VRAM usage percentage (one decimal place) |
+| vram_percent | number | VRAM usage percentage as an integer |
 | active_task_id | string or null | Task ID if an agent task is active |
 | active_task_description | string or null | Human readable task description if active |
 | local_ip | string | Machine's local LAN IP address |
 | ollama_port | number | Port Ollama is listening on |
 | blocking_processes | string[] | Process names currently triggering a block |
-| model_status | object | Map of model name to status string |
+| model_status | string[] | Human readable model status messages from FreeCycle |
 
-**Model status values:** `"not_downloaded"`, `"downloading"`, `"ready"`, `"error"`
+**Model status values:** FreeCycle currently exposes plain status strings rather than a keyed object. Preserve the array shape returned by the API.
 
 **GPU status values explained:**
-- `"available"`: GPU is free, Ollama is running, ready for work.
-- `"blocked_by_process"`: A blacklisted process (game) is running. Ollama is stopped.
-- `"blocked_by_cooldown"`: Game exited but cooldown timer (default 30 min) has not expired. Ollama stays stopped.
-- `"blocked_by_vram"`: Non whitelisted VRAM usage exceeds threshold (default 50%). Ollama is stopped.
-- `"error"`: GPU monitoring failed. Ollama state is uncertain.
+- `"Available"`: GPU is free, Ollama is running, ready for work.
+- `"Blocked (Game Running)"`: A blacklisted process is running. Ollama is stopped.
+- `"Cooldown"`: A post-game cooldown is active. Ollama stays stopped.
+- `"Wake Delay"`: The system recently resumed from sleep. Ollama stays stopped until the post-wake hold expires.
+- `"Agent Task Active"`: A tracked task is active and the tray is blue.
+- `"Downloading Models"`: Model work is active.
+- `"Error"`: GPU monitoring or Ollama lifecycle handling failed. Ollama state is uncertain.
+- `"Initializing"`: FreeCycle is still starting.
 
 #### POST /task/start
 
@@ -173,7 +181,7 @@ Signal that an agent is beginning a task that uses Ollama. Turns the tray icon b
 ```json
 {
   "ok": true,
-  "task_id": "abc-123"
+  "message": "Task 'abc-123' registered"
 }
 ```
 
@@ -181,9 +189,7 @@ Signal that an agent is beginning a task that uses Ollama. Turns the tray icon b
 ```json
 {
   "ok": false,
-  "error": "gpu_blocked",
-  "status": "blocked_by_process",
-  "blocking_processes": ["VRChat.exe"]
+  "message": "GPU is currently Blocked (Game Running)"
 }
 ```
 
@@ -211,7 +217,8 @@ Signal that an agent has completed its task. Reverts tray icon to green (or red 
 **Response (200 OK):**
 ```json
 {
-  "ok": true
+  "ok": true,
+  "message": "Task 'abc-123' stopped"
 }
 ```
 
@@ -219,7 +226,7 @@ Signal that an agent has completed its task. Reverts tray icon to green (or red 
 ```json
 {
   "ok": false,
-  "error": "task_not_found"
+  "message": "Task 'abc-123' not found"
 }
 ```
 
@@ -451,13 +458,13 @@ List models currently loaded in memory.
 
 ## Section 4: Required MCP Tools
 
-The MCP server must implement at minimum the following 14 tools. Each tool listing includes: name, description, input schema, and behavioral requirements.
+The MCP server must implement the same 13 tools that the shipped `mcp-server/src/tools.ts` currently exposes. Keep the names, primary inputs, and behavior aligned with that implementation.
 
-### 4.1 FreeCycle Status and Health Tools
+### 4.1 FreeCycle Status and Task Tools
 
 #### Tool: `freecycle_status`
 
-Get the full FreeCycle system status including GPU state, VRAM usage, Ollama health, active tasks, and model readiness.
+Get the complete FreeCycle status, including GPU state, VRAM usage, active task metadata, and model status messages.
 
 **Input Schema:**
 ```json
@@ -467,13 +474,12 @@ Get the full FreeCycle system status including GPU state, VRAM usage, Ollama hea
   "required": []
 }
 ```
-No input parameters. Returns the full /status JSON.
 
-**Behavior:** Call `GET /status` on the FreeCycle Agent API. Return the full JSON response. If the request fails, return an error with the HTTP status code and message.
+**Behavior:** Use the shared local-readiness helper first. If local inference is reachable, return the full `GET /status` payload. If local inference is unavailable, return the same structured cloud-fallback payload used by the shipped server, and include the latest FreeCycle status object when the FreeCycle host itself is reachable.
 
 #### Tool: `freecycle_health`
 
-Quick health check to verify FreeCycle is reachable and running.
+Check whether FreeCycle and Ollama are both reachable.
 
 **Input Schema:**
 ```json
@@ -484,38 +490,11 @@ Quick health check to verify FreeCycle is reachable and running.
 }
 ```
 
-**Behavior:** Call `GET /health` on the FreeCycle Agent API. Return `{ "healthy": true }` on 200 OK. On failure, return `{ "healthy": false, "error": "<message>" }`.
+**Behavior:** Run the same local-readiness helper. On success, return the JSON bodies from `GET /health` and the Ollama health check. On failure, return a structured local-unavailable result instead of throwing.
 
-#### Tool: `freecycle_gpu_available`
+#### Tool: `freecycle_start_task`
 
-Check whether the GPU is available for inference work. This is a convenience wrapper that checks status and returns a simple boolean with context.
-
-**Input Schema:**
-```json
-{
-  "type": "object",
-  "properties": {},
-  "required": []
-}
-```
-
-**Behavior:** Call `GET /status`. Return:
-```json
-{
-  "available": true,
-  "status": "available",
-  "ollama_running": true,
-  "vram_percent": 12.5,
-  "blocking_processes": []
-}
-```
-The `available` field is `true` only when `status === "available"` AND `ollama_running === true`.
-
-### 4.2 Task Management Tools
-
-#### Tool: `freecycle_task_start`
-
-Signal to FreeCycle that an agent task is beginning. This turns the tray icon blue and registers the task.
+Manually signal that a custom workflow is beginning GPU work.
 
 **Input Schema:**
 ```json
@@ -524,22 +503,22 @@ Signal to FreeCycle that an agent task is beginning. This turns the tray icon bl
   "properties": {
     "task_id": {
       "type": "string",
-      "description": "Unique identifier for this task. Use a descriptive slug or UUID."
+      "description": "Unique identifier for this task."
     },
     "description": {
       "type": "string",
-      "description": "Human readable description of what the task is doing. Shown in the FreeCycle tray tooltip."
+      "description": "Human readable description shown in the FreeCycle tray tooltip."
     }
   },
   "required": ["task_id", "description"]
 }
 ```
 
-**Behavior:** Call `POST /task/start`. On 200, return the success response. On 409 (GPU blocked), return the conflict response including blocking_processes. On network error, return an error.
+**Behavior:** Run the shared local-readiness helper first. Then call `POST /task/start`. On `200`, return the API response. On `409`, return the conflict body exactly as FreeCycle sends it. On transport or `5xx` errors, return a structured error.
 
-#### Tool: `freecycle_task_stop`
+#### Tool: `freecycle_stop_task`
 
-Signal to FreeCycle that an agent task has completed. Reverts the tray icon.
+Manually signal that a custom workflow has finished GPU work.
 
 **Input Schema:**
 ```json
@@ -548,67 +527,146 @@ Signal to FreeCycle that an agent task has completed. Reverts the tray icon.
   "properties": {
     "task_id": {
       "type": "string",
-      "description": "The task_id that was used in freecycle_task_start."
+      "description": "The task identifier used when starting the task."
     }
   },
   "required": ["task_id"]
 }
 ```
 
-**Behavior:** Call `POST /task/stop`. On 200, return success. On 404 (task not found), return the error response. On network error, return an error.
+**Behavior:** Run the shared local-readiness helper first. Then call `POST /task/stop`. On `200`, return the API response. On `404`, return the error body exactly as FreeCycle sends it. On transport or `5xx` errors, return a structured error.
 
-### 4.3 Ollama Inference Tools
+#### Tool: `freecycle_check_availability`
 
-#### Tool: `ollama_generate`
+Return a simple readiness decision for local inference.
 
-Generate a text completion using a local Ollama model.
+**Input Schema:**
+```json
+{
+  "type": "object",
+  "properties": {},
+  "required": []
+}
+```
+
+**Behavior:** Use the shared local-readiness helper. If local inference is reachable, return a compact JSON object such as:
+```json
+{
+  "available": true,
+  "status": "Available",
+  "ollama_running": true,
+  "vram_percent": 12,
+  "blocking_processes": []
+}
+```
+If local inference is unavailable, return the same structured cloud-fallback payload used elsewhere.
+
+These two manual task tools are the escape hatch for custom workflows. The local execution tools below must still auto-signal FreeCycle around their own Ollama work so users do not have to call the manual task tools themselves.
+
+### 4.2 Model Management Tools
+
+#### Tool: `freecycle_list_models`
+
+List models currently available from the local Ollama instance.
+
+**Input Schema:**
+```json
+{
+  "type": "object",
+  "properties": {},
+  "required": []
+}
+```
+
+**Behavior:** Run the shared local-readiness helper first, then call `GET /api/tags`. Return a friendly summary with model name, size in MB, modified time, and a short digest preview.
+
+#### Tool: `freecycle_show_model`
+
+Inspect a specific local model.
 
 **Input Schema:**
 ```json
 {
   "type": "object",
   "properties": {
-    "prompt": {
+    "model_name": {
       "type": "string",
-      "description": "The prompt text to send to the model."
-    },
+      "description": "Full model name including tag."
+    }
+  },
+  "required": ["model_name"]
+}
+```
+
+**Behavior:** Run the shared local-readiness helper first, then call `POST /api/show`. Return the response body.
+
+#### Tool: `freecycle_pull_model`
+
+Download a model to the local Ollama instance.
+
+**Input Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "model_name": {
+      "type": "string",
+      "description": "Model name to pull."
+    }
+  },
+  "required": ["model_name"]
+}
+```
+
+**Behavior:** Run the shared local-readiness helper first. Then wrap the pull with automatic `POST /task/start` and `POST /task/stop` using a short description such as `MCP pull: <model>`. Use a generous timeout. If task start returns `409`, return a structured local-unavailable result instead of starting the pull.
+
+### 4.3 Inference and Embedding Tools
+
+#### Tool: `freecycle_generate`
+
+Generate text with a local Ollama model.
+
+**Input Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
     "model": {
       "type": "string",
-      "description": "Model name to use. Default: llama3.1:8b-instruct-q4_K_M",
       "default": "llama3.1:8b-instruct-q4_K_M"
     },
+    "prompt": {
+      "type": "string"
+    },
+    "system_prompt": {
+      "type": "string"
+    },
     "temperature": {
-      "type": "number",
-      "description": "Sampling temperature (0.0 to 2.0). Default: 0.7",
-      "default": 0.7
+      "type": "number"
     },
     "max_tokens": {
-      "type": "number",
-      "description": "Maximum tokens to generate. Default: 512",
-      "default": 512
-    },
-    "system": {
-      "type": "string",
-      "description": "Optional system prompt to prepend."
+      "type": "integer"
     }
   },
   "required": ["prompt"]
 }
 ```
 
-**Behavior:** Call `POST /api/generate` with `stream: false`. Map `max_tokens` to `num_predict` in the options object. If `system` is provided, include it in the request body. Return the model's response text and usage statistics (eval_count, total_duration).
+**Behavior:** Run the shared local-readiness helper first. Then call `POST /api/generate` with `stream: false`. Map `max_tokens` to `num_predict`. Automatically wrap the full request with `POST /task/start` and `POST /task/stop` using a short task description such as `MCP generate: <model>`. Never include prompt text in the task description.
 
-**CRITICAL:** Always set `stream: false`. Always check FreeCycle status before sending inference requests (see Section 6, Negative Constraints).
+#### Tool: `freecycle_chat`
 
-#### Tool: `ollama_chat`
-
-Send a chat conversation to a local Ollama model with message history.
+Run a chat completion against a local Ollama model.
 
 **Input Schema:**
 ```json
 {
   "type": "object",
   "properties": {
+    "model": {
+      "type": "string",
+      "default": "llama3.1:8b-instruct-q4_K_M"
+    },
     "messages": {
       "type": "array",
       "items": {
@@ -623,178 +681,102 @@ Send a chat conversation to a local Ollama model with message history.
           }
         },
         "required": ["role", "content"]
-      },
-      "description": "Array of chat messages in chronological order."
+      }
     },
-    "model": {
-      "type": "string",
-      "description": "Model name to use. Default: llama3.1:8b-instruct-q4_K_M",
-      "default": "llama3.1:8b-instruct-q4_K_M"
+    "system_prompt": {
+      "type": "string"
     },
     "temperature": {
-      "type": "number",
-      "description": "Sampling temperature (0.0 to 2.0). Default: 0.7",
-      "default": 0.7
-    },
-    "max_tokens": {
-      "type": "number",
-      "description": "Maximum tokens to generate. Default: 512",
-      "default": 512
+      "type": "number"
     }
   },
   "required": ["messages"]
 }
 ```
 
-**Behavior:** Call `POST /api/chat` with `stream: false`. Return the assistant message content and usage statistics.
+**Behavior:** Run the shared local-readiness helper first. Then call `POST /api/chat` with `stream: false`. Automatically wrap the whole request with start and stop task signaling and ensure the stop signal runs in `finally`.
 
-#### Tool: `ollama_embed`
+#### Tool: `freecycle_embed`
 
-Generate vector embeddings for one or more text inputs using a local embedding model.
+Generate embeddings with the local Ollama embedding model.
 
 **Input Schema:**
 ```json
 {
   "type": "object",
   "properties": {
+    "model": {
+      "type": "string",
+      "default": "nomic-embed-text"
+    },
     "input": {
       "oneOf": [
         { "type": "string" },
         { "type": "array", "items": { "type": "string" } }
-      ],
-      "description": "A single string or array of strings to embed."
-    },
-    "model": {
-      "type": "string",
-      "description": "Embedding model to use. Default: nomic-embed-text",
-      "default": "nomic-embed-text"
+      ]
     }
   },
   "required": ["input"]
 }
 ```
 
-**Behavior:** Call `POST /api/embed`. Return the embeddings array and metadata (model, total_duration).
+**Behavior:** Run the shared local-readiness helper first. Then call `POST /api/embed`. Automatically wrap the full operation with task start and stop signaling. Return the embeddings plus model metadata.
 
-### 4.4 Model Management Tools
+### 4.4 Evaluation and Benchmarking Tools
 
-#### Tool: `ollama_list_models`
+#### Tool: `freecycle_evaluate_task`
 
-List all models currently downloaded on the Ollama instance.
-
-**Input Schema:**
-```json
-{
-  "type": "object",
-  "properties": {},
-  "required": []
-}
-```
-
-**Behavior:** Call `GET /api/tags`. Return the models array with name, size, parameter_size, quantization_level, and modified_at for each.
-
-#### Tool: `ollama_model_info`
-
-Get detailed information about a specific model.
+Recommend whether a task should run locally, in the cloud, or as a hybrid workflow.
 
 **Input Schema:**
 ```json
 {
   "type": "object",
   "properties": {
-    "name": {
-      "type": "string",
-      "description": "Full model name including tag, e.g. llama3.1:8b-instruct-q4_K_M"
-    }
-  },
-  "required": ["name"]
-}
-```
-
-**Behavior:** Call `POST /api/show`. Return model details, parameters, template, and family information.
-
-#### Tool: `ollama_pull_model`
-
-Download a model to the Ollama instance.
-
-**Input Schema:**
-```json
-{
-  "type": "object",
-  "properties": {
-    "name": {
-      "type": "string",
-      "description": "Model name to pull, e.g. mistral:7b-instruct-q4_K_M"
-    }
-  },
-  "required": ["name"]
-}
-```
-
-**Behavior:** Call `POST /api/pull` with `stream: false`. This is a blocking call that may take several minutes for large models. Return the final status. Consider setting a generous HTTP timeout (10+ minutes).
-
-#### Tool: `ollama_loaded_models`
-
-List models currently loaded into GPU memory.
-
-**Input Schema:**
-```json
-{
-  "type": "object",
-  "properties": {},
-  "required": []
-}
-```
-
-**Behavior:** Call `GET /api/ps`. Return the list of loaded models with their VRAM usage and expiry time.
-
-### 4.5 Utility Tools
-
-#### Tool: `ollama_delete_model`
-
-Delete a model from the Ollama instance.
-
-**Input Schema:**
-```json
-{
-  "type": "object",
-  "properties": {
-    "name": {
-      "type": "string",
-      "description": "Full model name including tag to delete."
-    }
-  },
-  "required": ["name"]
-}
-```
-
-**Behavior:** Call `DELETE /api/delete`. Return success or error.
-
-#### Tool: `freecycle_wait_for_gpu`
-
-Poll FreeCycle status until the GPU becomes available or a timeout is reached. Useful for workflows that need to wait for a game to exit.
-
-**Input Schema:**
-```json
-{
-  "type": "object",
-  "properties": {
-    "timeout_seconds": {
-      "type": "number",
-      "description": "Maximum seconds to wait. Default: 300 (5 minutes).",
-      "default": 300
+    "task_description": {
+      "type": "string"
     },
-    "poll_interval_seconds": {
-      "type": "number",
-      "description": "Seconds between status checks. Default: 10.",
-      "default": 10
+    "requirements": {
+      "type": "object",
+      "properties": {
+        "latency": { "type": "string", "enum": ["low", "normal"] },
+        "quality": { "type": "string", "enum": ["high", "normal"] },
+        "cost": { "type": "string", "enum": ["minimize", "normal"] },
+        "privacy": { "type": "string", "enum": ["critical", "normal"] }
+      }
     }
   },
-  "required": []
+  "required": ["task_description"]
 }
 ```
 
-**Behavior:** Poll `GET /status` at the specified interval. Return immediately if GPU is already available. If timeout is reached, return the last known status with `{ "timed_out": true }`. Cap timeout at 3600 seconds. Cap poll interval minimum at 5 seconds.
+**Behavior:** Use the same readiness logic as the executable tools. Combine availability with keyword-based workload classification and the optional `requirements` object. Return a JSON object containing `recommendation`, `reasoning`, `freecycle_status`, `local_available`, and `wake_on_lan_attempted`.
+
+#### Tool: `freecycle_benchmark`
+
+Benchmark a local model by running the same prompt several times.
+
+**Input Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "model": {
+      "type": "string"
+    },
+    "prompt": {
+      "type": "string"
+    },
+    "iterations": {
+      "type": "integer",
+      "default": 3
+    }
+  },
+  "required": ["model", "prompt"]
+}
+```
+
+**Behavior:** Run the shared local-readiness helper first. Then automatically signal one benchmark task for the full run, not once per iteration. For each iteration, call `POST /api/generate` with a small `num_predict` limit and return per-iteration latency plus average latency and average tokens per second.
 
 ---
 
@@ -806,20 +788,16 @@ Poll FreeCycle status until the GPU becomes available or a timeout is reached. U
 freecycle-mcp-server/
   src/
     index.ts              # Entry point, MCP server setup, stdio transport
-    tools/
-      status.ts           # freecycle_status, freecycle_health, freecycle_gpu_available
-      tasks.ts            # freecycle_task_start, freecycle_task_stop
-      inference.ts        # ollama_generate, ollama_chat, ollama_embed
-      models.ts           # ollama_list_models, ollama_model_info, ollama_pull_model,
-                          #   ollama_loaded_models, ollama_delete_model
-      wait.ts             # freecycle_wait_for_gpu
-    lib/
-      freecycle-client.ts # HTTP client for FreeCycle Agent API
-      ollama-client.ts    # HTTP client for Ollama API
-      config.ts           # Configuration loading (env vars, defaults)
-      errors.ts           # Error types and formatting
+    config.ts             # Config loading from file plus env overrides
+    availability.ts       # Shared wake and readiness logic
+    wake-on-lan.ts        # Magic-packet sender
+    freecycle-client.ts   # HTTP client for the FreeCycle Agent API
+    ollama-client.ts      # HTTP client for the Ollama API
+    task-signaling.ts     # Automatic /task/start and /task/stop wrapper
+    tools.ts              # Registers all 13 MCP tools
   package.json
   tsconfig.json
+  freecycle-mcp.config.json
   README.md
   test/
     test-server.ts        # End to end test script
@@ -862,17 +840,25 @@ await server.connect(transport);
 
 ### 5.4 Configuration
 
-The server must read configuration from environment variables with sensible defaults:
+The server must read configuration from a checked-in JSON file such as `freecycle-mcp.config.json`, with optional environment variable overrides:
 
-| Variable | Default | Description |
+| Config Key | Default | Description |
 |----------|---------|-------------|
-| FREECYCLE_HOST | localhost | FreeCycle machine hostname or IP |
-| FREECYCLE_AGENT_PORT | 7443 | FreeCycle Agent Signal API port |
-| FREECYCLE_OLLAMA_PORT | 11434 | Ollama API port |
-| FREECYCLE_TIMEOUT_MS | 30000 | Default HTTP request timeout in milliseconds |
-| FREECYCLE_PULL_TIMEOUT_MS | 600000 | Timeout for model pull operations (10 min) |
+| `freecycle.host` | `localhost` | FreeCycle machine hostname or IP |
+| `freecycle.port` | `7443` | FreeCycle Agent Signal API port |
+| `ollama.host` | `localhost` | Ollama host. Usually the same machine as FreeCycle |
+| `ollama.port` | `11434` | Ollama API port |
+| `timeouts.requestMs` | `10000` | Default HTTP request timeout in milliseconds |
+| `timeouts.pullMs` | `600000` | Timeout for model pull operations |
+| `wakeOnLan.enabled` | `false` | Enables the wake-and-wait flow |
+| `wakeOnLan.macAddress` | `""` | Target MAC address for wake-on-LAN |
+| `wakeOnLan.broadcastAddress` | `255.255.255.255` | UDP broadcast address for magic packets |
+| `wakeOnLan.port` | `9` | Wake-on-LAN UDP port |
+| `wakeOnLan.packetCount` | `5` | Number of magic packets sent per wake attempt |
+| `wakeOnLan.pollIntervalMs` | `30000` | Delay between FreeCycle readiness checks |
+| `wakeOnLan.maxWaitMs` | `900000` | Maximum wait before cloud fallback |
 
-Never hardcode IPs or ports. Always read from config.
+Optional override variables can still be supported (`FREECYCLE_MCP_CONFIG`, `FREECYCLE_HOST`, `FREECYCLE_PORT`, `OLLAMA_HOST`, `OLLAMA_PORT`, and `FREECYCLE_WOL_*`), but the JSON config file is the main control surface.
 
 ### 5.5 Tool Registration Example
 
@@ -928,7 +914,7 @@ server.tool(
             text: JSON.stringify({
               error: true,
               message: `Failed to reach FreeCycle: ${message}`,
-              hint: "Verify FreeCycle is running and FREECYCLE_HOST / FREECYCLE_AGENT_PORT are correct.",
+              hint: "Verify the FreeCycle host, port, and optional FREECYCLE_MCP_CONFIG path are correct.",
             }),
           },
         ],
@@ -945,7 +931,7 @@ Here is the pattern for a tool with validated input parameters:
 
 ```typescript
 server.tool(
-  "freecycle_task_start",
+  "freecycle_start_task",
   "Signal to FreeCycle that an agent task is beginning. Turns the tray icon blue.",
   {
     task_id: z.string().describe(
@@ -968,10 +954,8 @@ server.tool(
             {
               type: "text",
               text: JSON.stringify({
-                ok: false,
-                error: "gpu_blocked",
                 ...response.data,
-                hint: "GPU is currently in use. Wait for the blocking process to exit or use freecycle_wait_for_gpu.",
+                hint: "GPU is currently in use. Wait for FreeCycle to become available or use freecycle_check_availability to drive a cloud fallback decision.",
               }),
             },
           ],
@@ -982,7 +966,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify(response.data),
+            text: JSON.stringify(response.data, null, 2),
           },
         ],
       };
@@ -1008,7 +992,7 @@ server.tool(
 
 ### 5.7 HTTP Client Pattern
 
-Create a thin HTTP client wrapper for each API:
+Create a thin HTTP client wrapper for each API. The config loader should read a JSON file such as `freecycle-mcp.config.json`, then optionally allow environment variable overrides:
 
 ```typescript
 // lib/freecycle-client.ts
@@ -1025,8 +1009,8 @@ export class FreeCycleClient {
 
   constructor() {
     const config = getConfig();
-    this.baseUrl = `http://${config.freecycleHost}:${config.agentPort}`;
-    this.timeoutMs = config.timeoutMs;
+    this.baseUrl = `http://${config.freecycle.host}:${config.freecycle.port}`;
+    this.timeoutMs = config.timeouts.requestMs;
   }
 
   async get<T = unknown>(path: string): Promise<HttpResponse<T>> {
@@ -1104,39 +1088,103 @@ Every tool must follow these error handling rules:
 
 ### 5.9 Pre flight GPU Check Pattern
 
-Before sending any inference or embedding request to Ollama, the MCP server should check FreeCycle status:
+Before sending any inference, embedding, or model-management request to Ollama, the MCP server should follow this local-readiness flow:
+
+1. Check whether Ollama is already responding.
+2. If Ollama is down, check whether FreeCycle is reachable.
+3. If FreeCycle is unreachable and wake-on-LAN is enabled in the MCP config, silently send multiple magic packets to the configured FreeCycle host.
+4. Poll FreeCycle every 30 seconds by default, for up to 15 minutes by default, until the local server becomes usable or the configured maximum is hit.
+5. If wake-on-LAN is disabled, or the server never becomes ready, return a structured "route to cloud" result instead of hanging.
 
 ```typescript
-async function ensureGpuAvailable(
-  freecycleClient: FreeCycleClient
-): Promise<{ available: true } | { available: false; reason: string }> {
+async function ensureLocalAvailability(
+  freecycleClient: FreeCycleClient,
+  ollamaClient: OllamaClient,
+  config: McpConfig
+): Promise<
+  | { available: true; wakeOnLanAttempted: boolean }
+  | { available: false; reason: string; suggestedRoute: "cloud"; wakeOnLanAttempted: boolean }
+> {
   try {
-    const { data } = await freecycleClient.get<StatusResponse>("/status");
+    await ollamaClient.healthCheck();
+    return { available: true, wakeOnLanAttempted: false };
+  } catch (ollamaError) {
+    try {
+      const { data } = await freecycleClient.get<StatusResponse>("/status");
 
-    if (data.status !== "available") {
-      return {
-        available: false,
-        reason: `GPU is ${data.status}. Blocking processes: ${data.blocking_processes?.join(", ") || "none"}.`,
-      };
+      if (
+        data.status === "Blocked (Game Running)" ||
+        data.status === "Cooldown" ||
+        data.status === "Wake Delay" ||
+        data.status === "Error"
+      ) {
+        return {
+          available: false,
+          reason: `FreeCycle is reachable but local inference is ${data.status}.`,
+          suggestedRoute: "cloud",
+          wakeOnLanAttempted: false,
+        };
+      }
+    } catch {
+      if (!config.wakeOnLan.enabled) {
+        return {
+          available: false,
+          reason: `Ollama is down and wake-on-LAN is disabled. Last Ollama error: ${String(ollamaError)}`,
+          suggestedRoute: "cloud",
+          wakeOnLanAttempted: false,
+        };
+      }
+
+      await sendWakeOnLanPackets(config.wakeOnLan);
     }
 
-    if (!data.ollama_running) {
-      return {
-        available: false,
-        reason: "Ollama is not running. FreeCycle may be starting it.",
-      };
+    const deadline = Date.now() + config.wakeOnLan.maxWaitMs;
+    while (Date.now() <= deadline) {
+      try {
+        const { data } = await freecycleClient.get<StatusResponse>("/status");
+        if (
+          (data.status === "Available" || data.status === "Agent Task Active") &&
+          data.ollama_running
+        ) {
+          await ollamaClient.healthCheck();
+          return { available: true, wakeOnLanAttempted: true };
+        }
+
+        if (
+          data.status === "Blocked (Game Running)" ||
+          data.status === "Cooldown" ||
+          data.status === "Wake Delay" ||
+          data.status === "Error"
+        ) {
+          return {
+            available: false,
+            reason: `FreeCycle woke up but local inference is ${data.status}.`,
+            suggestedRoute: "cloud",
+            wakeOnLanAttempted: true,
+          };
+        }
+      } catch {
+        // Keep polling until the deadline.
+      }
+
+      await new Promise((resolve) =>
+        setTimeout(resolve, config.wakeOnLan.pollIntervalMs)
+      );
     }
 
-    return { available: true };
-  } catch {
-    // If we cannot reach FreeCycle, still try Ollama directly.
-    // FreeCycle may be down but Ollama could be running independently.
-    return { available: true };
+    return {
+      available: false,
+      reason: "Local inference never became reachable before the configured timeout.",
+      suggestedRoute: "cloud",
+      wakeOnLanAttempted: true,
+    };
   }
 }
 ```
 
-Use this check inside `ollama_generate`, `ollama_chat`, and `ollama_embed`. If the GPU is not available, return a descriptive message instead of attempting the request (which would fail or hang).
+Use this check inside every local-only MCP tool. If the local stack is not available, return the cloud fallback payload instead of attempting the Ollama request.
+
+After this readiness check passes, automatically wrap every local execution tool (`freecycle_generate`, `freecycle_chat`, `freecycle_embed`, `freecycle_pull_model`, and any benchmark or other long-running local job you add) with `POST /task/start` and `POST /task/stop`. Use one task signal pair per MCP invocation, not per nested Ollama call. This means a benchmark tool should signal once for the full benchmark run, not once per iteration.
 
 ### 5.10 Client Registration
 
@@ -1149,9 +1197,7 @@ Use this check inside `ollama_generate`, `ollama_chat`, and `ollama_embed`. If t
       "command": "npx",
       "args": ["tsx", "/absolute/path/to/freecycle-mcp-server/src/index.ts"],
       "env": {
-        "FREECYCLE_HOST": "localhost",
-        "FREECYCLE_AGENT_PORT": "7443",
-        "FREECYCLE_OLLAMA_PORT": "11434"
+        "FREECYCLE_MCP_CONFIG": "/absolute/path/to/freecycle-mcp-server/freecycle-mcp.config.json"
       }
     }
   }
@@ -1167,9 +1213,7 @@ Use this check inside `ollama_generate`, `ollama_chat`, and `ollama_embed`. If t
       "command": "npx",
       "args": ["tsx", "/absolute/path/to/freecycle-mcp-server/src/index.ts"],
       "env": {
-        "FREECYCLE_HOST": "localhost",
-        "FREECYCLE_AGENT_PORT": "7443",
-        "FREECYCLE_OLLAMA_PORT": "11434"
+        "FREECYCLE_MCP_CONFIG": "/absolute/path/to/freecycle-mcp-server/freecycle-mcp.config.json"
       }
     }
   }
@@ -1247,7 +1291,7 @@ async function runTests() {
   console.log("Test 5: Ollama generate");
   try {
     const status = await fc.get<{ status: string }>("/status");
-    if (status.data.status !== "available") {
+    if (status.data.status !== "Available") {
       console.log("  SKIP: GPU not available\n");
     } else {
       const gen = await ollama.post("/api/generate", {
@@ -1280,7 +1324,7 @@ These are absolute rules. Violating any of these makes the implementation incorr
 
 2. **No streaming responses without fallback.** Always set `"stream": false` when calling Ollama APIs. If you implement streaming support as an optional feature, always provide a non streaming fallback. MCP tool responses must return complete text, not incremental chunks.
 
-3. **No inference requests without checking FreeCycle status first.** Before calling `ollama_generate`, `ollama_chat`, or `ollama_embed`, check `GET /status` to verify `status === "available"` and `ollama_running === true`. If the GPU is blocked, return a descriptive message immediately instead of sending a request that will fail or hang.
+3. **No inference requests without checking FreeCycle status first.** Before calling `freecycle_generate`, `freecycle_chat`, or `freecycle_embed`, check local readiness and confirm FreeCycle is effectively available, which in the current implementation means `status` is `"Available"` or `"Agent Task Active"` and `ollama_running === true`. If the GPU is blocked, return a descriptive message immediately instead of sending a request that will fail or hang.
 
 4. **No swallowed errors.** Every `catch` block must return a meaningful error message to the MCP client. Never return an empty string or generic "error occurred" message. Include: what failed, the likely cause, and a suggested fix.
 
@@ -1300,6 +1344,8 @@ These are absolute rules. Violating any of these makes the implementation incorr
 
 12. **No tool names that conflict with built in MCP tools.** All tool names must be prefixed with `freecycle_` or `ollama_` to avoid collisions.
 
+13. **No missing automatic task signaling for local execution tools.** After readiness succeeds, every MCP tool that sends real work to Ollama must wrap that work with `POST /task/start` and `POST /task/stop`. Reserve the manual task tools for custom workflows outside the built-in local execution tools.
+
 ---
 
 ## Section 7: Output Format
@@ -1310,31 +1356,29 @@ When implementation is complete, deliver all of the following files. Each file m
 
 1. **`src/index.ts`**: Entry point. Creates the MCP server, registers all tools, connects stdio transport.
 
-2. **`src/tools/status.ts`**: Exports tool registration functions for `freecycle_status`, `freecycle_health`, `freecycle_gpu_available`.
+2. **`src/tools.ts`**: Registers all 13 tools: `freecycle_status`, `freecycle_health`, `freecycle_start_task`, `freecycle_stop_task`, `freecycle_check_availability`, `freecycle_list_models`, `freecycle_show_model`, `freecycle_pull_model`, `freecycle_generate`, `freecycle_chat`, `freecycle_embed`, `freecycle_evaluate_task`, and `freecycle_benchmark`.
 
-3. **`src/tools/tasks.ts`**: Exports tool registration functions for `freecycle_task_start`, `freecycle_task_stop`.
+3. **`src/freecycle-client.ts`**: HTTP client for the FreeCycle Agent API with timeout handling, typed responses, and helpers for start/stop task responses.
 
-4. **`src/tools/inference.ts`**: Exports tool registration functions for `ollama_generate`, `ollama_chat`, `ollama_embed`.
+4. **`src/ollama-client.ts`**: HTTP client for the Ollama API with typed generate/chat/embed/model methods and configurable timeouts.
 
-5. **`src/tools/models.ts`**: Exports tool registration functions for `ollama_list_models`, `ollama_model_info`, `ollama_pull_model`, `ollama_loaded_models`, `ollama_delete_model`.
+5. **`src/config.ts`**: Configuration loader reading `freecycle-mcp.config.json` with optional environment variable overrides.
 
-6. **`src/tools/wait.ts`**: Exports tool registration function for `freecycle_wait_for_gpu`.
+6. **`src/availability.ts`**: Shared wake-and-wait readiness helper that decides when to use local inference and when to return a cloud fallback result.
 
-7. **`src/lib/freecycle-client.ts`**: HTTP client for FreeCycle Agent API with timeout, error handling, and typed responses.
+7. **`src/wake-on-lan.ts`**: Magic-packet sender for wake-on-LAN.
 
-8. **`src/lib/ollama-client.ts`**: HTTP client for Ollama API with timeout, error handling, typed responses, and configurable pull timeout.
+8. **`src/task-signaling.ts`**: Helper that wraps local operations with `POST /task/start` and `POST /task/stop`, including cleanup on success, error, timeout, or early return.
 
-9. **`src/lib/config.ts`**: Configuration loader reading from environment variables with defaults.
+9. **`freecycle-mcp.config.json`**: Default MCP runtime config including FreeCycle host, Ollama host, timeouts, and wake-on-LAN settings.
 
-10. **`src/lib/errors.ts`**: Error formatting utilities.
+10. **`package.json`**: Complete with name, version, scripts (build, start, test), dependencies, and `"type": "module"`.
 
-11. **`package.json`**: Complete with name, version, scripts (build, start, test), dependencies, and `"type": "module"`.
+11. **`tsconfig.json`**: Configured for ES2022 target, ESM modules, strict mode, and Node.js module resolution.
 
-12. **`tsconfig.json`**: Configured for ES2022 target, ESM modules, strict mode, and Node.js module resolution.
+12. **`README.md`**: Installation instructions, configuration reference, MCP client registration examples (Claude Code, Claude Desktop, Codex), and troubleshooting guide.
 
-13. **`README.md`**: Installation instructions, configuration reference, MCP client registration examples (Claude Code, Claude Desktop, Codex), and troubleshooting guide.
-
-14. **`test/test-server.ts`**: End to end test script that validates connectivity and basic tool functionality.
+13. **`test/test-server.ts`**: End to end test script that validates connectivity and basic tool functionality.
 
 ### File Format Rules
 
@@ -1408,7 +1452,7 @@ Before considering the implementation complete, evaluate it against all 8 person
 - Is the pre flight GPU check properly abstracted and reused?
 - Is the HTTP client logic DRY (Don't Repeat Yourself)?
 - Are timeout values configurable and appropriate (30s for normal calls, 10min for model pulls)?
-- Does `freecycle_wait_for_gpu` properly handle edge cases (already available, timeout, unreachable)?
+- Does the shared availability helper properly handle edge cases (already available, timeout, unreachable, or wake-on-LAN disabled)?
 - Does error handling distinguish between network errors, HTTP errors, and unexpected responses?
 
 **Pass criteria:** The implementation handles all realistic failure modes without redundant code.
@@ -1416,7 +1460,7 @@ Before considering the implementation complete, evaluate it against all 8 person
 ### Personality 7: Output Format
 
 **What this personality checks:**
-- Are all 14 required deliverable files present?
+- Are all required deliverable files present?
 - Is package.json valid and complete (scripts, deps, type: module, bin field)?
 - Is tsconfig.json properly configured for ES2022 + ESM?
 - Are MCP tool responses always wrapped in `{ content: [{ type: "text", text: "..." }] }` format?
@@ -1432,8 +1476,8 @@ Before considering the implementation complete, evaluate it against all 8 person
 - What happens if FreeCycle returns unexpected JSON shape? (Expected: graceful degradation.)
 - What happens if a model pull takes 30 minutes? (Expected: extended timeout, not abort.)
 - What happens if task_start is called when GPU is blocked? (Expected: return 409 info, not crash.)
-- What happens if two clients call ollama_generate simultaneously? (Expected: both succeed or one gets a clear error from Ollama.)
-- What happens if VRAM is at 99%? (Expected: status correctly reports blocked_by_vram.)
+- What happens if two clients call `freecycle_generate` simultaneously? (Expected: both succeed or one gets a clear error from Ollama.)
+- What happens if VRAM is at 99%? (Expected: status correctly reports a blocked state such as `"Blocked (Game Running)"` or another non-available status.)
 - What happens if config env vars are missing? (Expected: use defaults, log a note.)
 
 **Pass criteria:** The server does not crash, hang, or return empty responses under any of these conditions.
@@ -1444,18 +1488,32 @@ Before considering the implementation complete, evaluate it against all 8 person
 
 | Status Value | Meaning | Ollama State | MCP Server Behavior |
 |-------------|---------|-------------|---------------------|
-| available | GPU free, no blocks | Running | Allow inference requests |
-| blocked_by_process | Game/app detected | Stopped | Reject inference, report blocker |
-| blocked_by_cooldown | Post game cooldown | Stopped | Reject inference, report wait time |
-| blocked_by_vram | VRAM threshold exceeded | Stopped | Reject inference, report usage |
-| error | GPU monitoring failed | Unknown | Warn, attempt Ollama directly |
+| Available | GPU free, no blocks | Running | Allow inference requests |
+| Agent Task Active | Another task is currently tracked | Running | Treat local inference as available, but show active-task context |
+| Blocked (Game Running) | Game or blocked process detected | Stopped | Return local-unavailable result |
+| Cooldown | Post-game cooldown | Stopped | Return local-unavailable result |
+| Wake Delay | System just resumed from sleep | Stopped | Return local-unavailable result |
+| Downloading Models | Model work is active | Usually running | Allow with caution if the current tool is compatible |
+| Error | GPU monitoring failed | Unknown | Return a clear local-unavailable or degraded-readiness result |
+| Initializing | FreeCycle is still starting | Unknown | Retry briefly or return local-unavailable |
 
 ## Quick Reference: Default Ports
 
-| Service | Default Port | Env Variable |
+| Service | Default Port | Config Key |
 |---------|-------------|-------------|
-| FreeCycle Agent API | 7443 | FREECYCLE_AGENT_PORT |
-| Ollama API | 11434 | FREECYCLE_OLLAMA_PORT |
+| FreeCycle Agent API | 7443 | `freecycle.port` |
+| Ollama API | 11434 | `ollama.port` |
+| Wake-on-LAN UDP | 9 | `wakeOnLan.port` |
+
+## Quick Reference: Wake-on-LAN Defaults
+
+| Setting | Default |
+|---------|---------|
+| `wakeOnLan.enabled` | `false` |
+| `wakeOnLan.packetCount` | `5` |
+| `wakeOnLan.packetIntervalMs` | `250` |
+| `wakeOnLan.pollIntervalMs` | `30000` |
+| `wakeOnLan.maxWaitMs` | `900000` |
 
 ## Quick Reference: Available Models (Default Config)
 

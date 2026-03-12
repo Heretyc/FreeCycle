@@ -4,6 +4,7 @@
 //! to signal task start/stop events. When a task starts, the tray icon turns blue
 //! and the tooltip shows the task description.
 
+use crate::logging::{scrub_http_preview, scrub_http_preview_default};
 use crate::state::{AgentTask, FreeCycleStatus};
 use crate::AppState;
 use anyhow::Result;
@@ -16,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{watch, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Request body for starting a task.
 ///
@@ -88,7 +89,7 @@ pub struct StatusResponse {
 }
 
 /// Generic success/error response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiResponse {
     /// Whether the operation succeeded.
     pub ok: bool,
@@ -99,6 +100,21 @@ pub struct ApiResponse {
 
 /// Shared state type alias for axum extractors.
 type SharedState = Arc<RwLock<AppState>>;
+
+const TASK_DESCRIPTION_PREVIEW_CHARS: usize = 120;
+
+fn log_request(method: &str, path: &str, source_ip: &str) {
+    debug!("HTTP request: {} {} from {}", method, path, source_ip);
+}
+
+fn build_router(state: SharedState) -> Router {
+    Router::new()
+        .route("/status", get(handle_status))
+        .route("/task/start", post(handle_task_start))
+        .route("/task/stop", post(handle_task_stop))
+        .route("/health", get(handle_health))
+        .with_state(state)
+}
 
 /// Runs the agent signal HTTP server.
 ///
@@ -132,12 +148,7 @@ pub async fn run_agent_server(
         )
     };
 
-    let app = Router::new()
-        .route("/status", get(handle_status))
-        .route("/task/start", post(handle_task_start))
-        .route("/task/stop", post(handle_task_stop))
-        .route("/health", get(handle_health))
-        .with_state(state);
+    let app = build_router(state);
 
     let addr: SocketAddr = format!("{}:{}", bind_address, port)
         .parse()
@@ -164,7 +175,9 @@ pub async fn run_agent_server(
 /// and other relevant state.
 async fn handle_status(
     State(state): State<SharedState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
 ) -> Json<StatusResponse> {
+    log_request("GET", "/status", &addr.ip().to_string());
     let s = state.read().await;
     let vram_percent = if s.vram_total_bytes > 0 {
         s.vram_used_bytes * 100 / s.vram_total_bytes
@@ -197,18 +210,31 @@ async fn handle_task_start(
     Json(req): Json<TaskStartRequest>,
 ) -> (StatusCode, Json<ApiResponse>) {
     let source_ip = addr.ip().to_string();
+    let task_id = scrub_http_preview_default(&req.task_id);
+    let description_preview = scrub_http_preview(&req.description, TASK_DESCRIPTION_PREVIEW_CHARS);
+    log_request("POST", "/task/start", &source_ip);
+
     info!(
-        "Agent task started: id='{}', desc='{}', from={}",
-        req.task_id, req.description, source_ip
+        "Agent task start received: id='{}', from={}",
+        task_id, source_ip
+    );
+    debug!(
+        "Agent task start description preview: '{}'",
+        description_preview
     );
 
     let mut s = state.write().await;
 
     // Only accept task signals when GPU is available (not blocked/cooldown)
-    if matches!(s.status, FreeCycleStatus::Blocked | FreeCycleStatus::Cooldown { .. }) {
+    if matches!(
+        s.status,
+        FreeCycleStatus::Blocked
+            | FreeCycleStatus::Cooldown { .. }
+            | FreeCycleStatus::WakeDelay { .. }
+    ) {
         warn!(
             "Rejecting task start '{}': GPU is currently {}",
-            req.task_id,
+            task_id,
             s.status.label()
         );
         return (
@@ -243,9 +269,16 @@ async fn handle_task_start(
 /// Clears the tracked agent task. The tray icon reverts to green (Available).
 async fn handle_task_stop(
     State(state): State<SharedState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
     Json(req): Json<TaskStopRequest>,
 ) -> (StatusCode, Json<ApiResponse>) {
-    info!("Agent task stopped: id='{}'", req.task_id);
+    let source_ip = addr.ip().to_string();
+    let task_id = scrub_http_preview_default(&req.task_id);
+    log_request("POST", "/task/stop", &source_ip);
+    info!(
+        "Agent task stop received: id='{}', from={}",
+        task_id, source_ip
+    );
 
     let mut s = state.write().await;
 
@@ -266,6 +299,11 @@ async fn handle_task_stop(
         }
     }
 
+    warn!(
+        "Agent task stop ignored: id='{}', from={}, reason=task_not_found",
+        task_id, source_ip
+    );
+
     (
         StatusCode::NOT_FOUND,
         Json(ApiResponse {
@@ -278,7 +316,10 @@ async fn handle_task_stop(
 /// Handles GET /health requests.
 ///
 /// Simple health check that returns 200 OK.
-async fn handle_health() -> (StatusCode, Json<ApiResponse>) {
+async fn handle_health(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+) -> (StatusCode, Json<ApiResponse>) {
+    log_request("GET", "/health", &addr.ip().to_string());
     (
         StatusCode::OK,
         Json(ApiResponse {
@@ -291,6 +332,12 @@ async fn handle_health() -> (StatusCode, Json<ApiResponse>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::FreeCycleConfig;
+    use crate::state::FreeCycleStatus;
+    use reqwest::Client;
+    use serde_json::json;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     #[test]
     fn test_task_start_request_deserialization() {
@@ -324,5 +371,195 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("Available"));
+    }
+
+    fn test_state(status: FreeCycleStatus) -> SharedState {
+        Arc::new(RwLock::new(AppState {
+            status,
+            config: FreeCycleConfig::default(),
+            agent_task: None,
+            manual_override: None,
+            last_blacklist_seen: None,
+            vram_idle_since: None,
+            wake_block_until: None,
+            ollama_running: false,
+            vram_used_bytes: 0,
+            vram_total_bytes: 0,
+            blocking_processes: vec!["VRChat.exe".to_string()],
+            local_ip: "192.168.1.10".to_string(),
+            model_status: Vec::new(),
+            models_downloading: false,
+        }))
+    }
+
+    async fn spawn_test_server(
+        state: SharedState,
+    ) -> (String, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                build_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+        });
+
+        (format!("http://{}", addr), shutdown_tx, server)
+    }
+
+    async fn shutdown_test_server(
+        shutdown_tx: oneshot::Sender<()>,
+        server: tokio::task::JoinHandle<()>,
+    ) {
+        let _ = shutdown_tx.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_task_start_records_remote_ip_via_connect_info() {
+        let state = test_state(FreeCycleStatus::Available);
+        let (base_url, shutdown_tx, server) = spawn_test_server(Arc::clone(&state)).await;
+        let client = Client::new();
+
+        let response = client
+            .post(format!("{}/task/start", base_url))
+            .json(&json!({
+                "task_id": "task-1",
+                "description": "Testing ConnectInfo",
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<ApiResponse>().await.unwrap(),
+            ApiResponse {
+                ok: true,
+                message: "Task 'task-1' registered".to_string(),
+            }
+        );
+
+        let state_guard = state.read().await;
+        let task = state_guard.agent_task.as_ref().unwrap();
+        assert_eq!(task.task_id, "task-1");
+        assert_eq!(task.description, "Testing ConnectInfo");
+        assert_eq!(task.source_ip, "127.0.0.1");
+        assert_eq!(state_guard.status, FreeCycleStatus::AgentTaskActive);
+        drop(state_guard);
+
+        shutdown_test_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn test_task_start_returns_conflict_when_gpu_is_blocked() {
+        let state = test_state(FreeCycleStatus::Blocked);
+        let (base_url, shutdown_tx, server) = spawn_test_server(Arc::clone(&state)).await;
+        let client = Client::new();
+
+        let response = client
+            .post(format!("{}/task/start", base_url))
+            .json(&json!({
+                "task_id": "blocked-task",
+                "description": "Should not start",
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.json::<ApiResponse>().await.unwrap(),
+            ApiResponse {
+                ok: false,
+                message: "GPU is currently Blocked (Game Running)".to_string(),
+            }
+        );
+
+        let state_guard = state.read().await;
+        assert!(state_guard.agent_task.is_none());
+        assert_eq!(state_guard.status, FreeCycleStatus::Blocked);
+        drop(state_guard);
+
+        shutdown_test_server(shutdown_tx, server).await;
+    }
+
+    #[tokio::test]
+    async fn test_task_stop_requires_matching_id_before_clearing_state() {
+        let state = test_state(FreeCycleStatus::AgentTaskActive);
+        {
+            let mut state_guard = state.write().await;
+            state_guard.agent_task = Some(AgentTask {
+                task_id: "task-1".to_string(),
+                description: "Tracked task".to_string(),
+                started_at: Instant::now(),
+                source_ip: "127.0.0.1".to_string(),
+            });
+        }
+
+        let (base_url, shutdown_tx, server) = spawn_test_server(Arc::clone(&state)).await;
+        let client = Client::new();
+
+        let mismatch = client
+            .post(format!("{}/task/stop", base_url))
+            .json(&json!({
+                "task_id": "other-task",
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(mismatch.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            mismatch.json::<ApiResponse>().await.unwrap(),
+            ApiResponse {
+                ok: false,
+                message: "Task 'other-task' not found".to_string(),
+            }
+        );
+
+        {
+            let state_guard = state.read().await;
+            assert_eq!(
+                state_guard
+                    .agent_task
+                    .as_ref()
+                    .map(|task| task.task_id.as_str()),
+                Some("task-1")
+            );
+            assert_eq!(state_guard.status, FreeCycleStatus::AgentTaskActive);
+        }
+
+        let matched = client
+            .post(format!("{}/task/stop", base_url))
+            .json(&json!({
+                "task_id": "task-1",
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(matched.status(), StatusCode::OK);
+        assert_eq!(
+            matched.json::<ApiResponse>().await.unwrap(),
+            ApiResponse {
+                ok: true,
+                message: "Task 'task-1' stopped".to_string(),
+            }
+        );
+
+        let state_guard = state.read().await;
+        assert!(state_guard.agent_task.is_none());
+        assert_eq!(state_guard.status, FreeCycleStatus::Available);
+        drop(state_guard);
+
+        shutdown_test_server(shutdown_tx, server).await;
     }
 }

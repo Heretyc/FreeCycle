@@ -58,6 +58,7 @@ pub fn register_freecycle_autostart() -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the registry key cannot be opened or the value cannot be deleted.
+#[allow(dead_code)]
 pub fn unregister_freecycle_autostart() -> Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let run_key = hkcu
@@ -131,7 +132,10 @@ fn disable_ollama_registry_run(hkey: winreg::HKEY, label: &str) -> Result<()> {
                 debug!("Ollama auto-start entry '{}' not found in {}", name, label);
             }
             Err(e) => {
-                warn!("Failed to remove Ollama auto-start '{}' from {}: {}", name, label, e);
+                warn!(
+                    "Failed to remove Ollama auto-start '{}' from {}: {}",
+                    name, label, e
+                );
             }
         }
     }
@@ -156,7 +160,10 @@ fn disable_ollama_scheduled_tasks() {
                 info!("Disabled Ollama scheduled task: {}", task_name);
             }
             Ok(_) => {
-                debug!("Ollama scheduled task '{}' not found or already disabled", task_name);
+                debug!(
+                    "Ollama scheduled task '{}' not found or already disabled",
+                    task_name
+                );
             }
             Err(e) => {
                 debug!("Could not check scheduled task '{}': {}", task_name, e);

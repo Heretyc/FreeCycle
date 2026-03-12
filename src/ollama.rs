@@ -4,7 +4,8 @@
 //! via `OLLAMA_HOST`, pulling required models, and periodic model update checks.
 
 use crate::config::FreeCycleConfig;
-use crate::state::FreeCycleStatus;
+use crate::logging::scrub_http_preview;
+use crate::state::{FreeCycleStatus, ManualOverride};
 use crate::AppState;
 use anyhow::{Context, Result};
 use std::process::Stdio;
@@ -53,10 +54,7 @@ fn find_ollama_exe(config: &FreeCycleConfig) -> Option<String> {
     }
 
     // Check PATH via `where ollama`
-    if let Ok(output) = std::process::Command::new("where")
-        .arg("ollama")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("where").arg("ollama").output() {
         if output.status.success() {
             if let Ok(path) = String::from_utf8(output.stdout) {
                 let first_line = path.lines().next().unwrap_or("").trim();
@@ -92,11 +90,13 @@ fn find_ollama_exe(config: &FreeCycleConfig) -> Option<String> {
 ///
 /// Returns an error if the Ollama executable is not found or cannot be spawned.
 async fn start_ollama(config: &FreeCycleConfig) -> Result<Child> {
-    let exe = find_ollama_exe(config)
-        .context("Ollama executable not found")?;
+    let exe = find_ollama_exe(config).context("Ollama executable not found")?;
 
     let host_value = format!("{}:{}", config.ollama.host, config.ollama.port);
-    info!("Starting Ollama: {} serve (OLLAMA_HOST={})", exe, host_value);
+    info!(
+        "Starting Ollama: {} serve (OLLAMA_HOST={})",
+        exe, host_value
+    );
 
     let child = Command::new(&exe)
         .arg("serve")
@@ -120,7 +120,10 @@ async fn start_ollama(config: &FreeCycleConfig) -> Result<Child> {
 /// * `timeout_secs` - Seconds to wait for graceful shutdown before force kill.
 async fn stop_ollama(child: &mut Child, timeout_secs: u64) {
     let pid = child.id().unwrap_or(0);
-    info!("Stopping Ollama (PID {}), waiting {}s for graceful shutdown", pid, timeout_secs);
+    info!(
+        "Stopping Ollama (PID {}), waiting {}s for graceful shutdown",
+        pid, timeout_secs
+    );
 
     // Try graceful shutdown by sending a request to the Ollama API
     // Ollama does not have a dedicated shutdown endpoint, so we kill the process
@@ -140,7 +143,10 @@ async fn stop_ollama(child: &mut Child, timeout_secs: u64) {
             let _ = child.kill().await;
         }
         Err(_) => {
-            warn!("Ollama did not exit within {}s. Force killing.", timeout_secs);
+            warn!(
+                "Ollama did not exit within {}s. Force killing.",
+                timeout_secs
+            );
             let _ = child.kill().await;
             // Also try taskkill /F as a fallback
             let _ = std::process::Command::new("taskkill")
@@ -201,12 +207,16 @@ pub async fn run_ollama_manager(
 
         let (should_run, config) = {
             let s = state.read().await;
-            let should_run = matches!(
-                s.status,
-                FreeCycleStatus::Available
-                    | FreeCycleStatus::AgentTaskActive
-                    | FreeCycleStatus::Downloading
-            );
+            let should_run = match s.manual_override {
+                Some(ManualOverride::ForceDisable) => false,
+                Some(ManualOverride::ForceEnable) => true,
+                None => matches!(
+                    s.status,
+                    FreeCycleStatus::Available
+                        | FreeCycleStatus::AgentTaskActive
+                        | FreeCycleStatus::Downloading
+                ),
+            };
             (should_run, s.config.clone())
         };
 
@@ -324,14 +334,17 @@ pub async fn run_model_manager(
             let model_exists = check_model_exists(&base_url, model).await;
 
             if !model_exists || should_update {
-                let action = if model_exists { "Updating" } else { "Downloading" };
+                let action = if model_exists {
+                    "Updating"
+                } else {
+                    "Downloading"
+                };
                 info!("{} model: {}", action, model);
 
                 {
                     let mut s = state.write().await;
                     s.models_downloading = true;
-                    s.model_status
-                        .push(format!("{}: {}", action, model));
+                    s.model_status.push(format!("{}: {}", action, model));
                 }
 
                 match pull_model(&base_url, model).await {
@@ -343,10 +356,11 @@ pub async fn run_model_manager(
                     Err(e) => {
                         warn!("Failed to pull model {}: {}", model, e);
                         let mut s = state.write().await;
-                        s.model_status
-                            .retain(|m| !m.contains(model));
-                        s.model_status
-                            .push(format!("Failed: {} (retrying in {}m)", model, config.models.retry_interval_minutes));
+                        s.model_status.retain(|m| !m.contains(model));
+                        s.model_status.push(format!(
+                            "Failed: {} (retrying in {}m)",
+                            model, config.models.retry_interval_minutes
+                        ));
                     }
                 }
             }
@@ -359,7 +373,10 @@ pub async fn run_model_manager(
         // Clear downloading flag if no more models in progress
         {
             let mut s = state.write().await;
-            s.models_downloading = s.model_status.iter().any(|m| m.starts_with("Downloading") || m.starts_with("Updating"));
+            s.models_downloading = s
+                .model_status
+                .iter()
+                .any(|m| m.starts_with("Downloading") || m.starts_with("Updating"));
         }
 
         // Wait for next check
@@ -429,14 +446,26 @@ async fn pull_model(base_url: &str, model: &str) -> Result<()> {
     } else {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Pull failed with status {}: {}", status, body)
+        anyhow::bail!("{}", format_http_error("Pull failed", status, &body))
     }
 }
 
+fn format_http_error(context: &str, status: reqwest::StatusCode, body: &str) -> String {
+    let preview = scrub_http_preview(body, 240);
+    if preview.is_empty() {
+        format!(
+            "{} with status {} and an empty response body",
+            context, status
+        )
+    } else {
+        format!("{} with status {}: {}", context, status, preview)
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::StatusCode;
 
     #[test]
     fn test_find_ollama_exe_returns_none_when_not_installed() {
@@ -450,5 +479,17 @@ mod tests {
         // This test verifies the explicit path check fails gracefully
         // The function may still find ollama via PATH
         let _ = find_ollama_exe(&config);
+    }
+
+    #[test]
+    fn test_format_http_error_redacts_sensitive_response_text() {
+        let message = format_http_error(
+            "Pull failed",
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"bad auth","token":"secret123","detail":"Authorization: Bearer abc123"}"#,
+        );
+        assert!(message.contains("[REDACTED]"));
+        assert!(!message.contains("secret123"));
+        assert!(!message.contains("abc123"));
     }
 }

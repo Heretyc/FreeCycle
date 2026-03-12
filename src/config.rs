@@ -179,19 +179,45 @@ pub struct AgentServerConfig {
 
 // Default value functions for serde
 
-fn default_gpu_check_interval() -> u64 { 5000 }
-fn default_tray_update_interval() -> u64 { 2000 }
-fn default_cooldown_seconds() -> u64 { 1800 }
-fn default_vram_threshold_percent() -> u64 { 50 }
-fn default_vram_idle_mb() -> u64 { 300 }
-fn default_vram_idle_timeout_minutes() -> u64 { 3 }
-fn default_task_timeout_hours() -> u64 { 1 }
-fn default_wake_delay_seconds() -> u64 { 60 }
-fn default_ollama_host() -> String { "0.0.0.0".to_string() }
-fn default_ollama_port() -> u16 { 11434 }
-fn default_graceful_shutdown_timeout() -> u64 { 10 }
-fn default_agent_port() -> u16 { 7443 }
-fn default_agent_bind() -> String { "0.0.0.0".to_string() }
+fn default_gpu_check_interval() -> u64 {
+    5000
+}
+fn default_tray_update_interval() -> u64 {
+    2000
+}
+fn default_cooldown_seconds() -> u64 {
+    1800
+}
+fn default_vram_threshold_percent() -> u64 {
+    50
+}
+fn default_vram_idle_mb() -> u64 {
+    300
+}
+fn default_vram_idle_timeout_minutes() -> u64 {
+    3
+}
+fn default_task_timeout_hours() -> u64 {
+    1
+}
+fn default_wake_delay_seconds() -> u64 {
+    60
+}
+fn default_ollama_host() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_ollama_port() -> u16 {
+    11434
+}
+fn default_graceful_shutdown_timeout() -> u64 {
+    10
+}
+fn default_agent_port() -> u16 {
+    7443
+}
+fn default_agent_bind() -> String {
+    "0.0.0.0".to_string()
+}
 
 fn default_required_models() -> Vec<String> {
     vec![
@@ -200,8 +226,12 @@ fn default_required_models() -> Vec<String> {
     ]
 }
 
-fn default_retry_interval() -> u64 { 5 }
-fn default_update_check_interval() -> u64 { 24 }
+fn default_retry_interval() -> u64 {
+    5
+}
+fn default_update_check_interval() -> u64 {
+    24
+}
 
 impl Default for GeneralConfig {
     fn default() -> Self {
@@ -238,8 +268,6 @@ impl Default for ModelConfig {
         }
     }
 }
-
-
 
 impl Default for AgentServerConfig {
     fn default() -> Self {
@@ -330,8 +358,7 @@ impl FreeCycleConfig {
             .with_context(|| format!("Failed to create config directory: {}", dir.display()))?;
 
         let path = config_path();
-        let contents = toml::to_string_pretty(self)
-            .context("Failed to serialize configuration")?;
+        let contents = toml::to_string_pretty(self).context("Failed to serialize configuration")?;
         std::fs::write(&path, contents)
             .with_context(|| format!("Failed to write config file: {}", path.display()))?;
         Ok(())

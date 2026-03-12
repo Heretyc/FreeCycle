@@ -5,23 +5,34 @@
 //! yellow (downloading), grey (error). Updates the tooltip every 2 seconds
 //! with VRAM usage, Ollama status, IP/port, and active task info.
 
-use crate::state::FreeCycleStatus;
+use crate::state::{FreeCycleStatus, ManualOverride};
 use crate::AppState;
 use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::{watch, RwLock};
+use tracing::{debug, info, warn};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
-use tracing::{debug, info};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::System::Power::{
+    RegisterSuspendResumeNotification, UnregisterSuspendResumeNotification, HPOWERNOTIFY,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, RegisterClassW,
+    SetWindowLongPtrW, UnregisterClassW, CREATESTRUCTW, DEVICE_NOTIFY_WINDOW_HANDLE, GWLP_USERDATA,
+    HMENU, HWND_MESSAGE, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
+    WINDOW_EX_STYLE, WM_DESTROY, WM_NCCREATE, WM_POWERBROADCAST, WNDCLASSW, WS_OVERLAPPED,
+};
 
 /// RGBA color values for each tray icon state.
-const COLOR_GREEN: [u8; 4] = [0x2E, 0xCC, 0x40, 0xFF];   // Available
-const COLOR_RED: [u8; 4] = [0xFF, 0x41, 0x36, 0xFF];      // Blocked/Cooldown
-const COLOR_BLUE: [u8; 4] = [0x00, 0x74, 0xD9, 0xFF];     // Agent Task Active
-const COLOR_YELLOW: [u8; 4] = [0xFF, 0xDC, 0x00, 0xFF];   // Downloading
-const COLOR_GREY: [u8; 4] = [0xAA, 0xAA, 0xAA, 0xFF];     // Error/Initializing
+const COLOR_GREEN: [u8; 4] = [0x2E, 0xCC, 0x40, 0xFF]; // Available
+const COLOR_RED: [u8; 4] = [0xFF, 0x41, 0x36, 0xFF]; // Blocked/Cooldown
+const COLOR_BLUE: [u8; 4] = [0x00, 0x74, 0xD9, 0xFF]; // Agent Task Active
+const COLOR_YELLOW: [u8; 4] = [0xFF, 0xDC, 0x00, 0xFF]; // Downloading
+const COLOR_GREY: [u8; 4] = [0xAA, 0xAA, 0xAA, 0xFF]; // Error/Initializing
 
 /// Size of the generated tray icon in pixels.
 const ICON_SIZE: u32 = 32;
@@ -85,9 +96,174 @@ fn status_color(status: &FreeCycleStatus, models_downloading: bool) -> [u8; 4] {
         FreeCycleStatus::Available => COLOR_GREEN,
         FreeCycleStatus::Blocked => COLOR_RED,
         FreeCycleStatus::Cooldown { .. } => COLOR_RED,
+        FreeCycleStatus::WakeDelay { .. } => COLOR_RED,
         FreeCycleStatus::AgentTaskActive => COLOR_BLUE,
         FreeCycleStatus::Downloading => COLOR_YELLOW,
         FreeCycleStatus::Error(_) => COLOR_GREY,
+    }
+}
+
+fn menu_status_label(status: &FreeCycleStatus, manual_override: Option<ManualOverride>) -> String {
+    match manual_override {
+        Some(override_mode) => format!("Status: {} ({})", status.label(), override_mode.label()),
+        None => format!("Status: {}", status.label()),
+    }
+}
+
+fn force_enable_item_enabled(manual_override: Option<ManualOverride>) -> bool {
+    manual_override != Some(ManualOverride::ForceEnable)
+}
+
+fn force_disable_item_enabled(manual_override: Option<ManualOverride>) -> bool {
+    manual_override != Some(ManualOverride::ForceDisable)
+}
+
+struct PowerEventContext {
+    state: Arc<RwLock<AppState>>,
+    runtime: *const Runtime,
+    suspend_seen_since_resume: AtomicBool,
+}
+
+fn wake_delay_replaces_visible_status(status: &FreeCycleStatus) -> bool {
+    !matches!(
+        status,
+        FreeCycleStatus::Blocked | FreeCycleStatus::Cooldown { .. } | FreeCycleStatus::Error(_)
+    )
+}
+
+fn apply_resume_wake_delay(
+    state: &mut AppState,
+    now: Instant,
+    saw_suspend_since_last_resume: bool,
+) -> bool {
+    if !saw_suspend_since_last_resume
+        && matches!(state.wake_block_until, Some(existing_deadline) if existing_deadline > now)
+    {
+        return false;
+    }
+
+    let wake_delay = Duration::from_secs(state.config.general.wake_delay_seconds);
+    let wake_block_until = now + wake_delay;
+    state.wake_block_until = Some(wake_block_until);
+
+    if state.manual_override == Some(ManualOverride::ForceEnable) {
+        state.manual_override = None;
+    }
+
+    if wake_delay_replaces_visible_status(&state.status) {
+        state.status = FreeCycleStatus::WakeDelay {
+            expires_at: wake_block_until,
+        };
+    }
+
+    true
+}
+
+unsafe extern "system" fn power_window_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_NCCREATE {
+        let create_struct = lparam as *const CREATESTRUCTW;
+        if !create_struct.is_null() {
+            let ctx = unsafe { (*create_struct).lpCreateParams } as *mut PowerEventContext;
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, ctx as isize);
+            }
+        }
+    }
+
+    let ctx_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut PowerEventContext;
+
+    if !ctx_ptr.is_null() && msg == WM_POWERBROADCAST {
+        let ctx = unsafe { &*ctx_ptr };
+        match wparam as u32 {
+            PBT_APMSUSPEND => {
+                ctx.suspend_seen_since_resume.store(true, Ordering::Relaxed);
+                info!("Received system suspend notification");
+            }
+            PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
+                let runtime = unsafe { &*ctx.runtime };
+                let saw_suspend_since_last_resume =
+                    ctx.suspend_seen_since_resume.swap(false, Ordering::Relaxed);
+                runtime.block_on(async {
+                    let mut state = ctx.state.write().await;
+                    let cleared_force_enable =
+                        state.manual_override == Some(ManualOverride::ForceEnable);
+                    let wake_delay_seconds = state.config.general.wake_delay_seconds;
+
+                    if apply_resume_wake_delay(
+                        &mut state,
+                        Instant::now(),
+                        saw_suspend_since_last_resume,
+                    ) {
+                        if cleared_force_enable {
+                            info!(
+                                "Received system resume notification. Applying {}s wake delay and clearing force enable override.",
+                                wake_delay_seconds
+                            );
+                        } else {
+                            info!(
+                                "Received system resume notification. Applying {}s wake delay.",
+                                wake_delay_seconds
+                            );
+                        }
+                    } else {
+                        debug!(
+                            "Ignoring duplicate system resume notification while wake delay is already active."
+                        );
+                    }
+                });
+            }
+            _ => {}
+        }
+
+        return 1;
+    }
+
+    if msg == WM_DESTROY {
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        }
+    }
+
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+fn to_wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+unsafe fn destroy_power_window(
+    power_window: HWND,
+    class_name: *const u16,
+    power_notification_handle: HPOWERNOTIFY,
+    power_context_ptr: *mut PowerEventContext,
+) {
+    if power_notification_handle != 0
+        && unsafe { UnregisterSuspendResumeNotification(power_notification_handle) } == 0
+    {
+        warn!("Failed to unregister suspend or resume notifications");
+    }
+
+    if !power_window.is_null() {
+        unsafe {
+            DestroyWindow(power_window);
+        }
+    }
+
+    if !class_name.is_null() {
+        unsafe {
+            UnregisterClassW(class_name, std::ptr::null_mut());
+        }
+    }
+
+    if !power_context_ptr.is_null() {
+        unsafe {
+            drop(Box::from_raw(power_context_ptr));
+        }
     }
 }
 
@@ -107,7 +283,16 @@ fn build_tooltip(state: &AppState) -> String {
     let mut lines: Vec<String> = Vec::new();
 
     // Status line
-    lines.push(format!("FreeCycle: {}", state.status.label()));
+    let status_line = match state.manual_override {
+        Some(ManualOverride::ForceEnable) => {
+            format!("FreeCycle: Forced Available ({})", state.status.label())
+        }
+        Some(ManualOverride::ForceDisable) => {
+            format!("FreeCycle: Forced Stop ({})", state.status.label())
+        }
+        None => format!("FreeCycle: {}", state.status.label()),
+    };
+    lines.push(status_line);
 
     // VRAM usage
     if state.vram_total_bytes > 0 {
@@ -135,14 +320,31 @@ fn build_tooltip(state: &AppState) -> String {
         lines.push(format!("Cooldown: {}s remaining", remaining.as_secs()));
     }
 
+    if let FreeCycleStatus::WakeDelay { expires_at } = &state.status {
+        let remaining = expires_at
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
+        lines.push(format!("Wake delay: {}s remaining", remaining.as_secs()));
+    }
+
     // Blocking processes
     if !state.blocking_processes.is_empty() {
-        lines.push(format!("Blocked by: {}", state.blocking_processes.join(", ")));
+        lines.push(format!(
+            "Blocked by: {}",
+            state.blocking_processes.join(", ")
+        ));
     }
 
     // Agent task info
     if let Some(ref task) = state.agent_task {
-        lines.push(format!("Task: {} (from {})", task.description, task.source_ip));
+        lines.push(format!(
+            "Task: {} (from {})",
+            task.description, task.source_ip
+        ));
+    }
+
+    if let Some(override_mode) = state.manual_override {
+        lines.push(format!("Override: {}", override_mode.label()));
     }
 
     // Model status
@@ -151,7 +353,10 @@ fn build_tooltip(state: &AppState) -> String {
     }
 
     // Agent server port
-    lines.push(format!("Agent API: port {}", state.config.agent_server.port));
+    lines.push(format!(
+        "Agent API: port {}",
+        state.config.agent_server.port
+    ));
 
     let tooltip = lines.join("\n");
 
@@ -183,6 +388,62 @@ pub fn run_tray(
     shutdown_tx: watch::Sender<bool>,
     runtime: &Runtime,
 ) -> Result<()> {
+    let class_name = to_wide_null("FreeCyclePowerEvents");
+    let window_name = to_wide_null("FreeCycle Power Event Window");
+    let power_context = Box::new(PowerEventContext {
+        state: Arc::clone(&state),
+        runtime: runtime as *const Runtime,
+        suspend_seen_since_resume: AtomicBool::new(false),
+    });
+    let power_context_ptr = Box::into_raw(power_context);
+
+    let power_window = unsafe {
+        let window_class = WNDCLASSW {
+            lpfnWndProc: Some(power_window_proc),
+            lpszClassName: class_name.as_ptr(),
+            ..std::mem::zeroed()
+        };
+        RegisterClassW(&window_class);
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            class_name.as_ptr(),
+            window_name.as_ptr(),
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            0 as HMENU,
+            std::ptr::null_mut(),
+            power_context_ptr.cast(),
+        )
+    };
+
+    if power_window.is_null() {
+        unsafe {
+            destroy_power_window(power_window, class_name.as_ptr(), 0, power_context_ptr);
+        }
+        anyhow::bail!("Failed to create hidden power event window");
+    }
+
+    let power_notification_handle =
+        unsafe { RegisterSuspendResumeNotification(power_window, DEVICE_NOTIFY_WINDOW_HANDLE) };
+
+    if power_notification_handle == 0 {
+        unsafe {
+            destroy_power_window(
+                power_window,
+                class_name.as_ptr(),
+                power_notification_handle,
+                power_context_ptr,
+            );
+        }
+        anyhow::bail!("Failed to register suspend or resume notifications");
+    }
+
+    info!("Registered hidden tray window for suspend or resume notifications");
+
     // Build context menu
     let menu = Menu::new();
     let item_status = MenuItem::new("Status: Initializing", false, None);
@@ -204,20 +465,36 @@ pub fn run_tray(
 
     // Create tray icon
     let initial_icon = make_icon(COLOR_GREY);
-    let tray = TrayIconBuilder::new()
+    let tray = match TrayIconBuilder::new()
         .with_icon(initial_icon)
         .with_tooltip("FreeCycle: Initializing...")
         .with_menu(Box::new(menu))
         .build()
-        .context("Failed to create tray icon")?;
+    {
+        Ok(tray) => tray,
+        Err(error) => {
+            unsafe {
+                destroy_power_window(
+                    power_window,
+                    class_name.as_ptr(),
+                    power_notification_handle,
+                    power_context_ptr,
+                );
+            }
+            return Err(error).context("Failed to create tray icon");
+        }
+    };
 
     info!("System tray icon created");
 
     let mut last_color = COLOR_GREY;
     let mut last_update = Instant::now();
+    let mut last_menu_label = "Status: Initializing".to_string();
+    let mut last_force_enable_enabled = true;
+    let mut last_force_disable_enabled = true;
 
     // Win32 message loop
-    unsafe {
+    let tray_result = unsafe {
         let mut msg: windows_sys::Win32::UI::WindowsAndMessaging::MSG = std::mem::zeroed();
 
         loop {
@@ -227,13 +504,23 @@ pub fn run_tray(
                     info!("Exit requested via tray menu");
                     let _ = shutdown_tx.send(true);
                     break;
+                } else if event.id() == item_force_enable.id() {
+                    runtime.block_on(async {
+                        let mut s = state.write().await;
+                        s.manual_override = Some(ManualOverride::ForceEnable);
+                    });
+                    info!("Tray override set: force enable Ollama");
+                } else if event.id() == item_force_disable.id() {
+                    runtime.block_on(async {
+                        let mut s = state.write().await;
+                        s.manual_override = Some(ManualOverride::ForceDisable);
+                    });
+                    info!("Tray override set: force disable Ollama");
                 } else if event.id() == item_open_logs.id() {
                     let log_path = dirs::home_dir()
                         .unwrap_or_default()
                         .join("freecycle-verbose.log");
-                    let _ = std::process::Command::new("notepad")
-                        .arg(log_path)
-                        .spawn();
+                    let _ = std::process::Command::new("notepad").arg(log_path).spawn();
                 } else if event.id() == item_open_config.id() {
                     let config_path = crate::config::config_path();
                     let _ = std::process::Command::new("notepad")
@@ -249,12 +536,22 @@ pub fn run_tray(
             });
 
             if last_update.elapsed() >= update_interval {
-                let (new_color, tooltip) = runtime.block_on(async {
-                    let s = state.read().await;
-                    let color = status_color(&s.status, s.models_downloading);
-                    let tooltip = build_tooltip(&s);
-                    (color, tooltip)
-                });
+                let (new_color, tooltip, menu_label, enable_force_enable, enable_force_disable) =
+                    runtime.block_on(async {
+                        let s = state.read().await;
+                        let color = status_color(&s.status, s.models_downloading);
+                        let tooltip = build_tooltip(&s);
+                        let menu_label = menu_status_label(&s.status, s.manual_override);
+                        let enable_force_enable = force_enable_item_enabled(s.manual_override);
+                        let enable_force_disable = force_disable_item_enabled(s.manual_override);
+                        (
+                            color,
+                            tooltip,
+                            menu_label,
+                            enable_force_enable,
+                            enable_force_disable,
+                        )
+                    });
 
                 // Only update icon if color changed
                 if new_color != last_color {
@@ -265,6 +562,18 @@ pub fn run_tray(
                 }
 
                 tray.set_tooltip(Some(&tooltip)).ok();
+                if menu_label != last_menu_label {
+                    item_status.set_text(&menu_label);
+                    last_menu_label = menu_label;
+                }
+                if enable_force_enable != last_force_enable_enabled {
+                    item_force_enable.set_enabled(enable_force_enable);
+                    last_force_enable_enabled = enable_force_enable;
+                }
+                if enable_force_disable != last_force_disable_enabled {
+                    item_force_disable.set_enabled(enable_force_disable);
+                    last_force_disable_enabled = enable_force_disable;
+                }
                 last_update = Instant::now();
             }
 
@@ -285,9 +594,19 @@ pub fn run_tray(
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+        Ok(())
+    };
+
+    unsafe {
+        destroy_power_window(
+            power_window,
+            class_name.as_ptr(),
+            power_notification_handle,
+            power_context_ptr,
+        );
     }
 
-    Ok(())
+    tray_result
 }
 
 #[cfg(test)]
@@ -305,8 +624,20 @@ mod tests {
 
     #[test]
     fn test_status_color_mapping() {
-        assert_eq!(status_color(&FreeCycleStatus::Available, false), COLOR_GREEN);
+        assert_eq!(
+            status_color(&FreeCycleStatus::Available, false),
+            COLOR_GREEN
+        );
         assert_eq!(status_color(&FreeCycleStatus::Blocked, false), COLOR_RED);
+        assert_eq!(
+            status_color(
+                &FreeCycleStatus::WakeDelay {
+                    expires_at: Instant::now()
+                },
+                false
+            ),
+            COLOR_RED
+        );
         assert_eq!(
             status_color(&FreeCycleStatus::AgentTaskActive, false),
             COLOR_BLUE
@@ -319,7 +650,26 @@ mod tests {
 
     #[test]
     fn test_status_color_downloading_overlay() {
-        assert_eq!(status_color(&FreeCycleStatus::Available, true), COLOR_YELLOW);
+        assert_eq!(
+            status_color(&FreeCycleStatus::Available, true),
+            COLOR_YELLOW
+        );
+    }
+
+    #[test]
+    fn test_menu_state_helpers_respect_mutual_exclusion() {
+        assert!(!force_enable_item_enabled(Some(
+            ManualOverride::ForceEnable
+        )));
+        assert!(force_enable_item_enabled(Some(
+            ManualOverride::ForceDisable
+        )));
+        assert!(!force_disable_item_enabled(Some(
+            ManualOverride::ForceDisable
+        )));
+        assert!(force_disable_item_enabled(Some(
+            ManualOverride::ForceEnable
+        )));
     }
 
     #[test]
@@ -333,5 +683,87 @@ mod tests {
 
         let tooltip = build_tooltip(&state);
         assert!(tooltip.len() <= 127 || tooltip.ends_with("..."));
+    }
+
+    #[test]
+    fn test_tooltip_shows_override_context() {
+        let config = crate::config::FreeCycleConfig::default();
+        let mut state = AppState::new(config);
+        state.status = FreeCycleStatus::Available;
+        state.manual_override = Some(ManualOverride::ForceDisable);
+
+        let tooltip = build_tooltip(&state);
+        assert!(tooltip.contains("Forced Stop"));
+    }
+
+    #[test]
+    fn test_tooltip_shows_wake_delay() {
+        let config = crate::config::FreeCycleConfig::default();
+        let mut state = AppState::new(config);
+        state.status = FreeCycleStatus::WakeDelay {
+            expires_at: Instant::now() + Duration::from_secs(45),
+        };
+
+        let tooltip = build_tooltip(&state);
+        assert!(tooltip.contains("Wake delay"));
+    }
+
+    #[test]
+    fn test_resume_wake_delay_clears_force_enable_override() {
+        let mut state = AppState::new(crate::config::FreeCycleConfig::default());
+        state.status = FreeCycleStatus::Available;
+        state.manual_override = Some(ManualOverride::ForceEnable);
+        let now = Instant::now();
+
+        assert!(apply_resume_wake_delay(&mut state, now, true));
+        assert!(state.manual_override.is_none());
+        assert!(matches!(state.status, FreeCycleStatus::WakeDelay { .. }));
+        assert_eq!(
+            state.wake_block_until,
+            Some(now + Duration::from_secs(state.config.general.wake_delay_seconds))
+        );
+    }
+
+    #[test]
+    fn test_duplicate_resume_does_not_extend_wake_delay() {
+        let mut state = AppState::new(crate::config::FreeCycleConfig::default());
+        let first_resume_at = Instant::now();
+
+        assert!(apply_resume_wake_delay(&mut state, first_resume_at, true));
+        let first_deadline = state.wake_block_until;
+
+        assert!(!apply_resume_wake_delay(
+            &mut state,
+            first_resume_at + Duration::from_secs(1),
+            false,
+        ));
+        assert_eq!(state.wake_block_until, first_deadline);
+    }
+
+    #[test]
+    fn test_resume_keeps_process_block_visible() {
+        let mut state = AppState::new(crate::config::FreeCycleConfig::default());
+        state.status = FreeCycleStatus::Blocked;
+
+        assert!(apply_resume_wake_delay(&mut state, Instant::now(), true));
+        assert_eq!(state.status, FreeCycleStatus::Blocked);
+        assert!(state.wake_block_until.is_some());
+    }
+
+    #[test]
+    fn test_resume_after_new_suspend_restarts_wake_delay() {
+        let mut state = AppState::new(crate::config::FreeCycleConfig::default());
+        let first_resume_at = Instant::now();
+        let second_resume_at = first_resume_at + Duration::from_secs(5);
+
+        assert!(apply_resume_wake_delay(&mut state, first_resume_at, true));
+        let first_deadline = state.wake_block_until;
+
+        assert!(apply_resume_wake_delay(&mut state, second_resume_at, true));
+        assert_ne!(state.wake_block_until, first_deadline);
+        assert_eq!(
+            state.wake_block_until,
+            Some(second_resume_at + Duration::from_secs(state.config.general.wake_delay_seconds))
+        );
     }
 }

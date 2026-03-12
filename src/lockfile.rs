@@ -60,8 +60,9 @@ impl ProcessLock {
 
         // Ensure the directory exists
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create lock directory: {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create lock directory: {}", parent.display())
+            })?;
         }
 
         // Check for existing lock
@@ -106,6 +107,7 @@ impl ProcessLock {
     /// # Errors
     ///
     /// Returns an error if the lockfile cannot be written.
+    #[allow(dead_code)]
     pub fn refresh(&self) -> Result<()> {
         write_lock(&self.path)
     }
