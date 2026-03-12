@@ -1,0 +1,79 @@
+[package]
+name = "freecycle"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "GPU-aware Ollama lifecycle manager for Windows. Monitors for games and GPU-intensive programs, automatically enabling/disabling networked Ollama access when the GPU is available."
+license = "Apache-2.0"
+repository = "https://github.com/lexiflexington/freecycle"
+readme = "README.md"
+keywords = ["ollama", "gpu", "windows", "llm", "nvidia"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "freecycle"
+path = "src/main.rs"
+
+[dependencies]
+# System tray
+tray-icon = "0.19"
+image = "0.25"
+
+# GPU monitoring (NVIDIA NVML)
+nvml-wrapper = "0.10"
+
+# Process enumeration
+sysinfo = "0.32"
+
+# Windows registry
+winreg = "0.55"
+
+# Win32 APIs
+windows-sys = { version = "0.59", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "time"] }
+tracing-appender = "0.2"
+
+# Serialization and config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# HTTP client (for Ollama API)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# HTTP server (for agent signal endpoint)
+axum = "0.7"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Time
+chrono = "0.4"
+
+# Directories
+dirs = "5"
+
+# Local IP detection
+local-ip-address = "0.6"
+
+# Credential scrubbing in logs
+regex-lite = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

@@ -1,0 +1,40 @@
+#!/usr/bin/env node
+
+/**
+ * FreeCycle MCP Server
+ *
+ * Exposes FreeCycle (GPU lifecycle manager) and Ollama (local LLM inference)
+ * as MCP tools for Claude Code, OpenAI Codex, or any MCP compatible client.
+ *
+ * Transport: stdio
+ * Default ports: FreeCycle 7443, Ollama 11434
+ * Override via env: FREECYCLE_HOST, FREECYCLE_PORT, OLLAMA_HOST, OLLAMA_PORT
+ */
+
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { registerTools } from "./tools.js";
+
+const server = new McpServer(
+  {
+    name: "freecycle-mcp",
+    version: "0.1.0",
+  },
+  {
+    capabilities: {
+      tools: {},
+    },
+  },
+);
+
+registerTools(server);
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+main().catch((e) => {
+  process.stderr.write(`Fatal: ${e instanceof Error ? e.message : String(e)}\n`);
+  process.exit(1);
+});
