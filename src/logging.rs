@@ -147,6 +147,8 @@ pub fn init_logging(verbose: bool) -> Result<LogGuard> {
 /// # Example
 ///
 /// ```
+/// use freecycle::logging::scrub_credentials;
+///
 /// let input = r#"{"token": "abc123", "name": "test"}"#;
 /// let scrubbed = scrub_credentials(input);
 /// assert!(scrubbed.contains("[REDACTED]"));

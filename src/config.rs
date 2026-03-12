@@ -58,11 +58,11 @@ pub struct FreeCycleConfig {
     pub models: ModelConfig,
 
     /// Processes that trigger GPU unavailability.
-    #[serde(default)]
+    #[serde(default = "default_blacklisted_processes")]
     pub blacklisted_processes: ProcessList,
 
     /// Processes exempt from VRAM/GPU usage checks.
-    #[serde(default)]
+    #[serde(default = "default_whitelisted_processes")]
     pub whitelisted_processes: ProcessList,
 
     /// Agent signal server settings.
@@ -226,6 +226,36 @@ fn default_required_models() -> Vec<String> {
     ]
 }
 
+fn default_blacklisted_processes() -> ProcessList {
+    ProcessList {
+        list: vec![
+            "VRChat.exe".to_string(),
+            "vrchat.exe".to_string(),
+            "Cyberpunk2077.exe".to_string(),
+            "HELLDIVERS2.exe".to_string(),
+            "GenshinImpact.exe".to_string(),
+            "ZenlessZoneZero.exe".to_string(),
+            "Overwatch.exe".to_string(),
+            "VALORANT.exe".to_string(),
+            "eldenring.exe".to_string(),
+            "MonsterHunterWilds.exe".to_string(),
+        ],
+    }
+}
+
+fn default_whitelisted_processes() -> ProcessList {
+    ProcessList {
+        list: vec![
+            "ollama_llama_server".to_string(),
+            "ollama_llama_server.exe".to_string(),
+            "ollama.exe".to_string(),
+            "ollama".to_string(),
+            "dwm.exe".to_string(),
+            "csrss.exe".to_string(),
+        ],
+    }
+}
+
 fn default_retry_interval() -> u64 {
     5
 }
@@ -284,30 +314,8 @@ impl Default for FreeCycleConfig {
             general: GeneralConfig::default(),
             ollama: OllamaConfig::default(),
             models: ModelConfig::default(),
-            blacklisted_processes: ProcessList {
-                list: vec![
-                    "VRChat.exe".to_string(),
-                    "vrchat.exe".to_string(),
-                    "Cyberpunk2077.exe".to_string(),
-                    "HELLDIVERS2.exe".to_string(),
-                    "GenshinImpact.exe".to_string(),
-                    "ZenlessZoneZero.exe".to_string(),
-                    "Overwatch.exe".to_string(),
-                    "VALORANT.exe".to_string(),
-                    "eldenring.exe".to_string(),
-                    "MonsterHunterWilds.exe".to_string(),
-                ],
-            },
-            whitelisted_processes: ProcessList {
-                list: vec![
-                    "ollama_llama_server".to_string(),
-                    "ollama_llama_server.exe".to_string(),
-                    "ollama.exe".to_string(),
-                    "ollama".to_string(),
-                    "dwm.exe".to_string(),
-                    "csrss.exe".to_string(),
-                ],
-            },
+            blacklisted_processes: default_blacklisted_processes(),
+            whitelisted_processes: default_whitelisted_processes(),
             agent_server: AgentServerConfig::default(),
         }
     }
@@ -396,6 +404,136 @@ port = 8080
         assert_eq!(config.general.gpu_check_interval_ms, 5000); // default
         assert_eq!(config.ollama.port, 8080);
         assert_eq!(config.ollama.host, "0.0.0.0"); // default
+    }
+
+    #[test]
+    fn test_nested_sections_backfill_missing_fields() {
+        let partial = r#"
+[general]
+cooldown_seconds = 42
+
+[ollama]
+host = "127.0.0.1"
+"#;
+
+        let config: FreeCycleConfig = toml::from_str(partial).unwrap();
+        let defaults = FreeCycleConfig::default();
+
+        assert_eq!(config.general.cooldown_seconds, 42);
+        assert_eq!(
+            config.general.gpu_check_interval_ms,
+            defaults.general.gpu_check_interval_ms
+        );
+        assert_eq!(
+            config.general.tray_update_interval_ms,
+            defaults.general.tray_update_interval_ms
+        );
+        assert_eq!(config.ollama.host, "127.0.0.1");
+        assert_eq!(config.ollama.port, defaults.ollama.port);
+        assert_eq!(
+            config.ollama.graceful_shutdown_timeout_seconds,
+            defaults.ollama.graceful_shutdown_timeout_seconds
+        );
+        assert_eq!(config.models.required, defaults.models.required);
+        assert_eq!(
+            config.blacklisted_processes.list,
+            defaults.blacklisted_processes.list
+        );
+        assert_eq!(
+            config.whitelisted_processes.list,
+            defaults.whitelisted_processes.list
+        );
+        assert_eq!(config.agent_server.port, defaults.agent_server.port);
+        assert_eq!(
+            config.agent_server.bind_address,
+            defaults.agent_server.bind_address
+        );
+    }
+
+    #[test]
+    fn test_ollama_exe_path_round_trip_and_none_omission() {
+        let mut config = FreeCycleConfig::default();
+        config.ollama.exe_path = Some(r"C:\Program Files\Ollama\ollama.exe".to_string());
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("exe_path = "));
+        assert!(serialized.contains("Program Files"));
+        assert!(serialized.contains("ollama.exe"));
+
+        let deserialized: FreeCycleConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.ollama.exe_path.as_deref(),
+            Some(r"C:\Program Files\Ollama\ollama.exe")
+        );
+        assert_eq!(deserialized.ollama.port, config.ollama.port);
+        assert_eq!(
+            deserialized.general.cooldown_seconds,
+            config.general.cooldown_seconds
+        );
+
+        let without_exe_path = toml::to_string_pretty(&FreeCycleConfig::default()).unwrap();
+        assert!(!without_exe_path.contains("exe_path"));
+    }
+
+    #[test]
+    fn test_empty_process_lists_override_defaults() {
+        let config: FreeCycleConfig = toml::from_str(
+            r#"
+[blacklisted_processes]
+list = []
+
+[whitelisted_processes]
+list = []
+"#,
+        )
+        .unwrap();
+
+        assert!(config.blacklisted_processes.list.is_empty());
+        assert!(config.whitelisted_processes.list.is_empty());
+    }
+
+    #[test]
+    fn test_invalid_config_types_are_rejected() {
+        let invalid_numeric_type = r#"
+[general]
+cooldown_seconds = "3600"
+"#;
+        assert!(toml::from_str::<FreeCycleConfig>(invalid_numeric_type).is_err());
+
+        let invalid_negative_number = r#"
+[agent_server]
+port = -1
+"#;
+        assert!(toml::from_str::<FreeCycleConfig>(invalid_negative_number).is_err());
+
+        let invalid_scalar_for_array = r#"
+[models]
+required = "llama3.1:8b-instruct-q4_K_M"
+"#;
+        assert!(toml::from_str::<FreeCycleConfig>(invalid_scalar_for_array).is_err());
+    }
+
+    #[test]
+    fn test_partial_models_and_agent_server_tables_use_defaults() {
+        let partial = r#"
+[models]
+retry_interval_minutes = 15
+
+[agent_server]
+bind_address = "127.0.0.1"
+"#;
+
+        let config: FreeCycleConfig = toml::from_str(partial).unwrap();
+        let defaults = FreeCycleConfig::default();
+
+        assert_eq!(config.models.retry_interval_minutes, 15);
+        assert_eq!(
+            config.models.update_check_interval_hours,
+            defaults.models.update_check_interval_hours
+        );
+        assert_eq!(config.models.required, defaults.models.required);
+        assert_eq!(config.agent_server.bind_address, "127.0.0.1");
+        assert_eq!(config.agent_server.port, defaults.agent_server.port);
     }
 
     #[test]

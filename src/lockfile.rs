@@ -31,6 +31,8 @@ fn lock_path() -> PathBuf {
 /// # Example
 ///
 /// ```no_run
+/// use freecycle::lockfile::ProcessLock;
+///
 /// let lock = ProcessLock::acquire().unwrap();
 /// if lock.is_none() {
 ///     println!("Another instance is running");

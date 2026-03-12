@@ -78,7 +78,11 @@ pub async fn run_gpu_monitor(state: Arc<RwLock<AppState>>, mut shutdown_rx: watc
         // Check for blacklisted processes
         let blacklisted_detected = {
             let s = state.read().await;
-            find_blacklisted_processes(&pid_name_map, &s.config.blacklisted_processes.list)
+            find_blacklisted_processes(
+                &pid_name_map,
+                &s.config.blacklisted_processes.list,
+                &s.config.whitelisted_processes.list,
+            )
         };
 
         // Query VRAM usage
@@ -346,13 +350,16 @@ fn check_agent_task_timeout(s: &mut AppState) {
 fn find_blacklisted_processes(
     pid_name_map: &HashMap<u32, String>,
     blacklist: &[String],
+    whitelist: &[String],
 ) -> Vec<String> {
     let mut found = Vec::new();
     let blacklist_lower: Vec<String> = blacklist.iter().map(|s| s.to_lowercase()).collect();
+    let whitelist_lower: Vec<String> = whitelist.iter().map(|s| s.to_lowercase()).collect();
 
     for name in pid_name_map.values() {
         let name_lower = name.to_lowercase();
-        if blacklist_lower.contains(&name_lower) && !found.contains(name) {
+        let is_whitelisted = whitelist_lower.contains(&name_lower);
+        if !is_whitelisted && blacklist_lower.contains(&name_lower) && !found.contains(name) {
             found.push(name.clone());
         }
     }
@@ -399,6 +406,8 @@ fn calculate_non_whitelisted_vram(
 mod tests {
     use super::*;
     use crate::state::AgentTask;
+    use nvml_wrapper::enums::device::UsedGpuMemory;
+    use nvml_wrapper::struct_wrappers::device::ProcessInfo;
 
     fn test_state() -> AppState {
         AppState::new(crate::config::FreeCycleConfig::default())
@@ -413,11 +422,20 @@ mod tests {
         }
     }
 
+    fn test_process_info(pid: u32, used_gpu_memory: UsedGpuMemory) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            used_gpu_memory,
+            gpu_instance_id: None,
+            compute_instance_id: None,
+        }
+    }
+
     #[test]
     fn test_find_blacklisted_processes_empty() {
         let map = HashMap::new();
         let blacklist = vec!["VRChat.exe".to_string()];
-        assert!(find_blacklisted_processes(&map, &blacklist).is_empty());
+        assert!(find_blacklisted_processes(&map, &blacklist, &[]).is_empty());
     }
 
     #[test]
@@ -426,7 +444,7 @@ mod tests {
         map.insert(1, "vrchat.exe".to_string());
         map.insert(2, "explorer.exe".to_string());
         let blacklist = vec!["VRChat.exe".to_string()];
-        let found = find_blacklisted_processes(&map, &blacklist);
+        let found = find_blacklisted_processes(&map, &blacklist, &[]);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0], "vrchat.exe");
     }
@@ -437,8 +455,99 @@ mod tests {
         map.insert(1, "VRChat.exe".to_string());
         map.insert(2, "VRChat.exe".to_string());
         let blacklist = vec!["VRChat.exe".to_string()];
-        let found = find_blacklisted_processes(&map, &blacklist);
+        let found = find_blacklisted_processes(&map, &blacklist, &[]);
         assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn test_find_blacklisted_processes_whitelist_takes_precedence() {
+        let mut map = HashMap::new();
+        map.insert(1, "VRChat.exe".to_string());
+        map.insert(2, "Cyberpunk2077.exe".to_string());
+
+        let blacklist = vec!["vrchat.exe".to_string(), "cyberpunk2077.exe".to_string()];
+        let whitelist = vec!["VRChat.exe".to_string()];
+
+        let found = find_blacklisted_processes(&map, &blacklist, &whitelist);
+
+        assert_eq!(found, vec!["Cyberpunk2077.exe".to_string()]);
+    }
+
+    #[test]
+    fn test_calculate_non_whitelisted_vram_excludes_whitelisted_processes() {
+        let gpu_processes = vec![
+            test_process_info(1, UsedGpuMemory::Used(256)),
+            test_process_info(2, UsedGpuMemory::Used(512)),
+        ];
+        let pid_name_map =
+            HashMap::from([(1, "ollama.exe".to_string()), (2, "game.exe".to_string())]);
+        let whitelist = vec!["ollama.exe".to_string()];
+
+        let total = calculate_non_whitelisted_vram(&gpu_processes, &pid_name_map, &whitelist);
+
+        assert_eq!(total, 512);
+    }
+
+    #[test]
+    fn test_calculate_non_whitelisted_vram_whitelist_is_case_insensitive() {
+        let gpu_processes = vec![test_process_info(1, UsedGpuMemory::Used(256))];
+        let pid_name_map = HashMap::from([(1, "OLLAMA.EXE".to_string())]);
+        let whitelist = vec!["ollama.exe".to_string()];
+
+        let total = calculate_non_whitelisted_vram(&gpu_processes, &pid_name_map, &whitelist);
+
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_calculate_non_whitelisted_vram_sums_only_non_whitelisted_processes() {
+        let gpu_processes = vec![
+            test_process_info(1, UsedGpuMemory::Used(128)),
+            test_process_info(2, UsedGpuMemory::Used(256)),
+            test_process_info(3, UsedGpuMemory::Used(512)),
+        ];
+        let pid_name_map = HashMap::from([
+            (1, "ollama.exe".to_string()),
+            (2, "dwm.exe".to_string()),
+            (3, "render.exe".to_string()),
+        ]);
+        let whitelist = vec!["ollama.exe".to_string(), "dwm.exe".to_string()];
+
+        let total = calculate_non_whitelisted_vram(&gpu_processes, &pid_name_map, &whitelist);
+
+        assert_eq!(total, 512);
+    }
+
+    #[test]
+    fn test_calculate_non_whitelisted_vram_counts_unknown_pids() {
+        let gpu_processes = vec![test_process_info(99, UsedGpuMemory::Used(1024))];
+        let pid_name_map = HashMap::new();
+        let whitelist = vec!["ollama.exe".to_string()];
+
+        let total = calculate_non_whitelisted_vram(&gpu_processes, &pid_name_map, &whitelist);
+
+        assert_eq!(total, 1024);
+    }
+
+    #[test]
+    fn test_calculate_non_whitelisted_vram_uses_substring_whitelist_matching() {
+        let gpu_processes = vec![test_process_info(1, UsedGpuMemory::Used(2048))];
+        let pid_name_map = HashMap::from([(1, "ollama_llama_server.exe".to_string())]);
+        let whitelist = vec!["ollama".to_string()];
+
+        let total = calculate_non_whitelisted_vram(&gpu_processes, &pid_name_map, &whitelist);
+
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_calculate_non_whitelisted_vram_ignores_unavailable_memory_entries() {
+        let gpu_processes = vec![test_process_info(1, UsedGpuMemory::Unavailable)];
+        let pid_name_map = HashMap::from([(1, "game.exe".to_string())]);
+
+        let total = calculate_non_whitelisted_vram(&gpu_processes, &pid_name_map, &[]);
+
+        assert_eq!(total, 0);
     }
 
     #[test]
@@ -573,12 +682,64 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_raw_gpu_status_restarts_cooldown_after_repeated_blacklist_cycle() {
+        let now = Instant::now();
+        let mut state = test_state();
+        let first_seen = now - Duration::from_secs(120);
+        state.last_blacklist_seen = Some(first_seen);
+
+        let first_cooldown_status = compute_raw_gpu_status(&mut state, &[], false, 0, 1024, now);
+        assert_eq!(
+            first_cooldown_status,
+            FreeCycleStatus::Cooldown {
+                expires_at: first_seen + Duration::from_secs(state.config.general.cooldown_seconds),
+            }
+        );
+
+        let second_seen = now + Duration::from_secs(10);
+        let blocked_status = compute_raw_gpu_status(
+            &mut state,
+            &[String::from("VRChat.exe")],
+            false,
+            0,
+            1024,
+            second_seen,
+        );
+        assert_eq!(blocked_status, FreeCycleStatus::Blocked);
+        assert_eq!(state.last_blacklist_seen, Some(second_seen));
+
+        let resumed_at = second_seen + Duration::from_secs(1);
+        let second_cooldown_status =
+            compute_raw_gpu_status(&mut state, &[], false, 0, 1024, resumed_at);
+        assert_eq!(
+            second_cooldown_status,
+            FreeCycleStatus::Cooldown {
+                expires_at: second_seen
+                    + Duration::from_secs(state.config.general.cooldown_seconds),
+            }
+        );
+        assert_ne!(state.last_blacklist_seen, Some(first_seen));
+    }
+
+    #[test]
+    fn test_compute_raw_gpu_status_cooldown_expires_at_exact_boundary() {
+        let now = Instant::now();
+        let mut state = test_state();
+        state.last_blacklist_seen =
+            Some(now - Duration::from_secs(state.config.general.cooldown_seconds));
+
+        let status = compute_raw_gpu_status(&mut state, &[], false, 0, 1024, now);
+
+        assert_eq!(status, FreeCycleStatus::Available);
+        assert!(state.last_blacklist_seen.is_none());
+    }
+
+    #[test]
     fn test_compute_raw_gpu_status_clears_expired_cooldown_timestamp() {
         let now = Instant::now();
         let mut state = test_state();
-        state.last_blacklist_seen = Some(
-            now - Duration::from_secs(state.config.general.cooldown_seconds + 1),
-        );
+        state.last_blacklist_seen =
+            Some(now - Duration::from_secs(state.config.general.cooldown_seconds + 1));
 
         let status = compute_raw_gpu_status(&mut state, &[], false, 0, 1024, now);
 
@@ -682,9 +843,8 @@ mod tests {
             }
         );
 
-        state.last_blacklist_seen = Some(
-            now - Duration::from_secs(state.config.general.cooldown_seconds + 1),
-        );
+        state.last_blacklist_seen =
+            Some(now - Duration::from_secs(state.config.general.cooldown_seconds + 1));
         let wake_until = state.wake_block_until.unwrap();
         let wake_status = compute_raw_gpu_status(&mut state, &[], true, 4096, 2048, now);
         assert_eq!(

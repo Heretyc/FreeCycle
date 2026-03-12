@@ -6,7 +6,7 @@
 
 use crate::logging::{scrub_http_preview, scrub_http_preview_default};
 use crate::state::{AgentTask, FreeCycleStatus};
-use crate::AppState;
+use crate::SharedAppState;
 use anyhow::Result;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -14,9 +14,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 /// Request body for starting a task.
@@ -52,7 +51,7 @@ pub struct TaskStopRequest {
 /// Response body for status queries.
 ///
 /// Returns the current FreeCycle status, VRAM info, and active task details.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct StatusResponse {
     /// Current status label (e.g., "Available", "Blocked").
     pub status: String,
@@ -98,16 +97,14 @@ pub struct ApiResponse {
     pub message: String,
 }
 
-/// Shared state type alias for axum extractors.
-type SharedState = Arc<RwLock<AppState>>;
-
 const TASK_DESCRIPTION_PREVIEW_CHARS: usize = 120;
+type SharedState = SharedAppState;
 
 fn log_request(method: &str, path: &str, source_ip: &str) {
     debug!("HTTP request: {} {} from {}", method, path, source_ip);
 }
 
-fn build_router(state: SharedState) -> Router {
+pub fn build_agent_server_router(state: SharedAppState) -> Router {
     Router::new()
         .route("/status", get(handle_status))
         .route("/task/start", post(handle_task_start))
@@ -137,7 +134,7 @@ fn build_router(state: SharedState) -> Router {
 ///
 /// Returns an error if the server fails to bind or encounters a fatal error.
 pub async fn run_agent_server(
-    state: SharedState,
+    state: SharedAppState,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let (bind_address, port) = {
@@ -148,7 +145,7 @@ pub async fn run_agent_server(
         )
     };
 
-    let app = build_router(state);
+    let app = build_agent_server_router(state);
 
     let addr: SocketAddr = format!("{}:{}", bind_address, port)
         .parse()
@@ -332,12 +329,15 @@ async fn handle_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AppState;
     use crate::config::FreeCycleConfig;
     use crate::state::FreeCycleStatus;
     use reqwest::Client;
     use serde_json::json;
+    use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+    use tokio::sync::RwLock;
 
     #[test]
     fn test_task_start_request_deserialization() {
@@ -402,7 +402,8 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                build_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+                build_agent_server_router(state)
+                    .into_make_service_with_connect_info::<SocketAddr>(),
             )
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
