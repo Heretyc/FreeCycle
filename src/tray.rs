@@ -6,6 +6,7 @@
 //! with VRAM usage, Ollama status, IP/port, and active task info.
 
 use crate::lockfile::ProcessLock;
+use crate::notifications::{self, BalloonKind};
 use crate::state::{FreeCycleStatus, ManualOverride};
 use crate::{AppState, REMOTE_MODEL_INSTALL_UNLOCK_DURATION};
 use anyhow::{Context, Result};
@@ -646,6 +647,37 @@ pub fn run_tray(
 
                 tray.set_tooltip(Some(&tooltip)).ok();
                 if menu_label != last_menu_label {
+                    let old_blocked = last_menu_label.contains("Blocked")
+                        || last_menu_label.contains("Cooldown");
+                    let new_blocked =
+                        menu_label.contains("Blocked") || menu_label.contains("Cooldown");
+                    let new_available = menu_label.contains("Available");
+                    let new_error = menu_label.contains("Error");
+                    let old_error = last_menu_label.contains("Error");
+
+                    if new_blocked && !old_blocked {
+                        notifications::show_balloon(
+                            power_window,
+                            "FreeCycle: GPU Blocked",
+                            "A game was detected. Ollama stopped.",
+                            BalloonKind::Warning,
+                        );
+                    } else if new_available && old_blocked {
+                        notifications::show_balloon(
+                            power_window,
+                            "FreeCycle: GPU Available",
+                            "Ollama is running and available.",
+                            BalloonKind::Info,
+                        );
+                    } else if new_error && !old_error {
+                        notifications::show_balloon(
+                            power_window,
+                            "FreeCycle: Error",
+                            "An error occurred. Check the tray tooltip for details.",
+                            BalloonKind::Error,
+                        );
+                    }
+
                     item_status.set_text(&menu_label);
                     last_menu_label = menu_label;
                 }

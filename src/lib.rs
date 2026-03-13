@@ -12,6 +12,7 @@ pub mod config;
 pub mod gpu_monitor;
 pub mod lockfile;
 pub mod logging;
+pub mod notifications;
 pub mod ollama;
 pub mod state;
 pub mod tray;
