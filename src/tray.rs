@@ -5,6 +5,7 @@
 //! yellow (downloading), grey (error). Updates the tooltip every 2 seconds
 //! with VRAM usage, Ollama status, IP/port, and active task info.
 
+use crate::lockfile::ProcessLock;
 use crate::state::{FreeCycleStatus, ManualOverride};
 use crate::{AppState, REMOTE_MODEL_INSTALL_UNLOCK_DURATION};
 use anyhow::{Context, Result};

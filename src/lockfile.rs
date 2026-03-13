@@ -109,7 +109,6 @@ impl ProcessLock {
     /// # Errors
     ///
     /// Returns an error if the lockfile cannot be written.
-    #[allow(dead_code)]
     pub fn refresh(&self) -> Result<()> {
         write_lock(&self.path)
     }
