@@ -6,7 +6,7 @@
 //! with VRAM usage, Ollama status, IP/port, and active task info.
 
 use crate::state::{FreeCycleStatus, ManualOverride};
-use crate::AppState;
+use crate::{AppState, REMOTE_MODEL_INSTALL_UNLOCK_DURATION};
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -116,6 +116,32 @@ fn force_enable_item_enabled(manual_override: Option<ManualOverride>) -> bool {
 
 fn force_disable_item_enabled(manual_override: Option<ManualOverride>) -> bool {
     manual_override != Some(ManualOverride::ForceDisable)
+}
+
+fn format_remaining_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs().max(1);
+    if seconds >= 3600 {
+        let hours = seconds.div_ceil(3600);
+        format!("{}h left", hours)
+    } else if seconds >= 120 {
+        let minutes = seconds.div_ceil(60);
+        format!("{}m left", minutes)
+    } else {
+        format!("{}s left", seconds)
+    }
+}
+
+fn remote_model_install_menu_label(state: &AppState, now: Instant) -> String {
+    match state.remote_model_install_unlock_remaining(now) {
+        Some(remaining) => format!(
+            "Disable Remote Model Installs ({})",
+            format_remaining_duration(remaining)
+        ),
+        None => format!(
+            "Enable Remote Model Installs ({} Hour)",
+            REMOTE_MODEL_INSTALL_UNLOCK_DURATION.as_secs() / 3600
+        ),
+    }
 }
 
 struct PowerEventContext {
@@ -281,6 +307,7 @@ unsafe fn destroy_power_window(
 /// A formatted tooltip string (max 128 chars for Windows, truncated if needed).
 fn build_tooltip(state: &AppState) -> String {
     let mut lines: Vec<String> = Vec::new();
+    let now = Instant::now();
 
     // Status line
     let status_line = match state.manual_override {
@@ -293,6 +320,13 @@ fn build_tooltip(state: &AppState) -> String {
         None => format!("FreeCycle: {}", state.status.label()),
     };
     lines.push(status_line);
+
+    if let Some(remaining) = state.remote_model_install_unlock_remaining(now) {
+        lines.push(format!(
+            "Remote installs: {}",
+            format_remaining_duration(remaining)
+        ));
+    }
 
     // VRAM usage
     if state.vram_total_bytes > 0 {
@@ -347,9 +381,14 @@ fn build_tooltip(state: &AppState) -> String {
         lines.push(format!("Override: {}", override_mode.label()));
     }
 
-    // Model status
+    // Active model progress should outrank less important metadata so percentages remain visible.
     for status in &state.model_status {
-        lines.push(status.clone());
+        if status.starts_with("Downloading ")
+            || status.starts_with("Updating ")
+            || status.starts_with("Failed: ")
+        {
+            lines.push(status.clone());
+        }
     }
 
     // Agent server port
@@ -358,14 +397,24 @@ fn build_tooltip(state: &AppState) -> String {
         state.config.agent_server.port
     ));
 
-    let tooltip = lines.join("\n");
+    let mut tooltip_lines: Vec<String> = Vec::new();
+    let mut total_len = 0usize;
 
-    // Windows tooltip max is 128 chars; truncate if needed
-    if tooltip.len() > 127 {
-        format!("{}...", &tooltip[..124])
-    } else {
-        tooltip
+    for line in lines {
+        let separator_len = if tooltip_lines.is_empty() { 0 } else { 1 };
+        if total_len + separator_len + line.len() > 127 {
+            break;
+        }
+
+        total_len += separator_len + line.len();
+        tooltip_lines.push(line);
     }
+
+    if tooltip_lines.is_empty() {
+        return "FreeCycle".to_string();
+    }
+
+    tooltip_lines.join("\n")
 }
 
 /// Runs the system tray icon and Windows message loop.
@@ -449,6 +498,8 @@ pub fn run_tray(
     let item_status = MenuItem::new("Status: Initializing", false, None);
     let item_force_enable = MenuItem::new("Force Enable Ollama", true, None);
     let item_force_disable = MenuItem::new("Force Disable Ollama", true, None);
+    let item_remote_model_installs =
+        MenuItem::new("Enable Remote Model Installs (1 Hour)", true, None);
     let item_open_logs = MenuItem::new("Open Logs", true, None);
     let item_open_config = MenuItem::new("Open Config", true, None);
     let item_quit = MenuItem::new("Exit FreeCycle", true, None);
@@ -457,6 +508,7 @@ pub fn run_tray(
     menu.append(&PredefinedMenuItem::separator()).ok();
     menu.append(&item_force_enable).ok();
     menu.append(&item_force_disable).ok();
+    menu.append(&item_remote_model_installs).ok();
     menu.append(&PredefinedMenuItem::separator()).ok();
     menu.append(&item_open_logs).ok();
     menu.append(&item_open_config).ok();
@@ -492,6 +544,7 @@ pub fn run_tray(
     let mut last_menu_label = "Status: Initializing".to_string();
     let mut last_force_enable_enabled = true;
     let mut last_force_disable_enabled = true;
+    let mut last_remote_model_install_label = "Enable Remote Model Installs (1 Hour)".to_string();
 
     // Win32 message loop
     let tray_result = unsafe {
@@ -516,6 +569,22 @@ pub fn run_tray(
                         s.manual_override = Some(ManualOverride::ForceDisable);
                     });
                     info!("Tray override set: force disable Ollama");
+                } else if event.id() == item_remote_model_installs.id() {
+                    runtime.block_on(async {
+                        let mut s = state.write().await;
+                        let now = Instant::now();
+                        s.clear_expired_remote_model_install_unlock(now);
+                        if s.remote_model_install_unlocked(now) {
+                            s.disable_remote_model_install_unlock();
+                            info!("Tray toggle disabled: remote model installs locked");
+                        } else {
+                            s.enable_remote_model_install_unlock(now);
+                            info!(
+                                "Tray toggle enabled: remote model installs unlocked for {} hour",
+                                REMOTE_MODEL_INSTALL_UNLOCK_DURATION.as_secs() / 3600
+                            );
+                        }
+                    });
                 } else if event.id() == item_open_logs.id() {
                     let log_path = dirs::home_dir()
                         .unwrap_or_default()
@@ -536,22 +605,34 @@ pub fn run_tray(
             });
 
             if last_update.elapsed() >= update_interval {
-                let (new_color, tooltip, menu_label, enable_force_enable, enable_force_disable) =
-                    runtime.block_on(async {
-                        let s = state.read().await;
-                        let color = status_color(&s.status, s.models_downloading);
-                        let tooltip = build_tooltip(&s);
-                        let menu_label = menu_status_label(&s.status, s.manual_override);
-                        let enable_force_enable = force_enable_item_enabled(s.manual_override);
-                        let enable_force_disable = force_disable_item_enabled(s.manual_override);
-                        (
-                            color,
-                            tooltip,
-                            menu_label,
-                            enable_force_enable,
-                            enable_force_disable,
-                        )
-                    });
+                let (
+                    new_color,
+                    tooltip,
+                    menu_label,
+                    enable_force_enable,
+                    enable_force_disable,
+                    remote_model_install_label,
+                ) = runtime.block_on(async {
+                    let mut s = state.write().await;
+                    let now = Instant::now();
+                    if s.clear_expired_remote_model_install_unlock(now) {
+                        info!("Tray toggle expired: remote model installs locked");
+                    }
+                    let color = status_color(&s.status, s.models_downloading);
+                    let tooltip = build_tooltip(&s);
+                    let menu_label = menu_status_label(&s.status, s.manual_override);
+                    let enable_force_enable = force_enable_item_enabled(s.manual_override);
+                    let enable_force_disable = force_disable_item_enabled(s.manual_override);
+                    let remote_model_install_label = remote_model_install_menu_label(&s, now);
+                    (
+                        color,
+                        tooltip,
+                        menu_label,
+                        enable_force_enable,
+                        enable_force_disable,
+                        remote_model_install_label,
+                    )
+                });
 
                 // Only update icon if color changed
                 if new_color != last_color {
@@ -573,6 +654,10 @@ pub fn run_tray(
                 if enable_force_disable != last_force_disable_enabled {
                     item_force_disable.set_enabled(enable_force_disable);
                     last_force_disable_enabled = enable_force_disable;
+                }
+                if remote_model_install_label != last_remote_model_install_label {
+                    item_remote_model_installs.set_text(&remote_model_install_label);
+                    last_remote_model_install_label = remote_model_install_label;
                 }
                 last_update = Instant::now();
             }
@@ -680,9 +765,36 @@ mod tests {
         state.ollama_running = true;
         state.vram_used_bytes = 2 * 1024 * 1024 * 1024;
         state.vram_total_bytes = 8 * 1024u64 * 1024 * 1024;
+        state.model_status = vec!["Downloading llama3.1:8b-instruct-q4_K_M: 42%".to_string()];
 
         let tooltip = build_tooltip(&state);
-        assert!(tooltip.len() <= 127 || tooltip.ends_with("..."));
+        assert!(tooltip.len() <= 127);
+    }
+
+    #[test]
+    fn test_tooltip_prefers_download_progress_over_agent_api_port() {
+        let config = crate::config::FreeCycleConfig::default();
+        let mut state = AppState::new(config);
+        state.status = FreeCycleStatus::Available;
+        state.ollama_running = true;
+        state.vram_used_bytes = 2 * 1024 * 1024 * 1024;
+        state.vram_total_bytes = 8 * 1024u64 * 1024 * 1024;
+        state.model_status = vec!["Downloading llama3.1:8b-instruct-q4_K_M: 42%".to_string()];
+
+        let tooltip = build_tooltip(&state);
+        assert!(tooltip.contains("42%"));
+        assert!(!tooltip.contains("Agent API:"));
+    }
+
+    #[test]
+    fn test_tooltip_shows_failure_retry_text() {
+        let config = crate::config::FreeCycleConfig::default();
+        let mut state = AppState::new(config);
+        state.status = FreeCycleStatus::Available;
+        state.model_status = vec!["Failed: nomic-embed-text (retrying in 5m)".to_string()];
+
+        let tooltip = build_tooltip(&state);
+        assert!(tooltip.contains("retrying in 5m"));
     }
 
     #[test]
@@ -706,6 +818,33 @@ mod tests {
 
         let tooltip = build_tooltip(&state);
         assert!(tooltip.contains("Wake delay"));
+    }
+
+    #[test]
+    fn test_tooltip_shows_remote_model_install_unlock() {
+        let config = crate::config::FreeCycleConfig::default();
+        let mut state = AppState::new(config);
+        state.status = FreeCycleStatus::Available;
+        state.remote_model_install_unlocked_until = Some(Instant::now() + Duration::from_secs(90));
+
+        let tooltip = build_tooltip(&state);
+        assert!(tooltip.contains("Remote installs"));
+    }
+
+    #[test]
+    fn test_remote_model_install_menu_label_reflects_lock_state() {
+        let config = crate::config::FreeCycleConfig::default();
+        let mut state = AppState::new(config);
+        let now = Instant::now();
+
+        assert_eq!(
+            remote_model_install_menu_label(&state, now),
+            "Enable Remote Model Installs (1 Hour)"
+        );
+
+        state.remote_model_install_unlocked_until = Some(now + Duration::from_secs(90));
+        assert!(remote_model_install_menu_label(&state, now)
+            .starts_with("Disable Remote Model Installs"));
     }
 
     #[test]

@@ -103,7 +103,7 @@ export function resolveBase(): string {
 async function requestJson<T>(
   url: string,
   init?: RequestInit,
-  timeoutMs = getConfig().timeouts.requestMs,
+  timeoutMs = getConfig().timeouts.requestSecs * 1000,
 ): Promise<T> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -136,7 +136,7 @@ async function requestJson<T>(
 async function requestText(
   url: string,
   init?: RequestInit,
-  timeoutMs = getConfig().timeouts.requestMs,
+  timeoutMs = getConfig().timeouts.requestSecs * 1000,
 ): Promise<string> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -196,7 +196,7 @@ export async function generate(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     },
-    getConfig().timeouts.inferenceMs,
+    getConfig().timeouts.inferenceSecs * 1000,
   );
 }
 
@@ -229,7 +229,7 @@ export async function chat(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     },
-    getConfig().timeouts.inferenceMs,
+    getConfig().timeouts.inferenceSecs * 1000,
   );
 }
 
@@ -248,7 +248,7 @@ export async function embed(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     },
-    getConfig().timeouts.inferenceMs,
+    getConfig().timeouts.inferenceSecs * 1000,
   );
 }
 
@@ -284,6 +284,6 @@ export async function pullModel(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, stream: false }),
     },
-    getConfig().timeouts.pullMs,
+    getConfig().timeouts.pullSecs * 1000,
   );
 }

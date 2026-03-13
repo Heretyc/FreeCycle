@@ -78,7 +78,7 @@ async function waitForAvailability(
   initialReason: string,
 ): Promise<LocalAvailability> {
   const config = getConfig();
-  const deadline = Date.now() + config.wakeOnLan.maxWaitMs;
+  const deadline = Date.now() + config.wakeOnLan.maxWaitSecs * 1000;
   let lastFreecycleMessage = initialReason;
   let lastOllamaMessage = initialReason;
 
@@ -125,18 +125,18 @@ async function waitForAvailability(
       lastFreecycleMessage = statusResult.message;
     }
 
-    if (Date.now() + config.wakeOnLan.pollIntervalMs > deadline) {
+    if (Date.now() + config.wakeOnLan.pollIntervalSecs * 1000 > deadline) {
       break;
     }
 
-    await sleep(config.wakeOnLan.pollIntervalMs);
+    await sleep(config.wakeOnLan.pollIntervalSecs * 1000);
   }
 
   return availabilityResult({
     available: false,
     wakeOnLanAttempted,
     reason:
-      `Local Ollama did not become available within ${Math.round(config.wakeOnLan.maxWaitMs / 1000)} seconds. ` +
+      `Local Ollama did not become available within ${config.wakeOnLan.maxWaitSecs} seconds. ` +
       `Last FreeCycle check: ${lastFreecycleMessage}. Last Ollama check: ${lastOllamaMessage}.`,
   });
 }

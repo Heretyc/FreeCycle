@@ -7,9 +7,9 @@ export interface EndpointConfig {
 }
 
 export interface TimeoutConfig {
-  requestMs: number;
-  inferenceMs: number;
-  pullMs: number;
+  requestSecs: number;
+  inferenceSecs: number;
+  pullSecs: number;
 }
 
 export interface WakeOnLanConfig {
@@ -18,9 +18,9 @@ export interface WakeOnLanConfig {
   broadcastAddress: string;
   port: number;
   packetCount: number;
-  packetIntervalMs: number;
-  pollIntervalMs: number;
-  maxWaitMs: number;
+  packetIntervalSecs: number;
+  pollIntervalSecs: number;
+  maxWaitSecs: number;
 }
 
 export interface McpServerConfig {
@@ -47,9 +47,9 @@ const DEFAULT_CONFIG: McpServerConfig = {
     port: 11434,
   },
   timeouts: {
-    requestMs: 10_000,
-    inferenceMs: 5 * 60 * 1000,
-    pullMs: 10 * 60 * 1000,
+    requestSecs: 10,
+    inferenceSecs: 300,
+    pullSecs: 600,
   },
   wakeOnLan: {
     enabled: false,
@@ -57,9 +57,9 @@ const DEFAULT_CONFIG: McpServerConfig = {
     broadcastAddress: "255.255.255.255",
     port: 9,
     packetCount: 5,
-    packetIntervalMs: 250,
-    pollIntervalMs: 30_000,
-    maxWaitMs: 15 * 60 * 1000,
+    packetIntervalSecs: 0.25,
+    pollIntervalSecs: 30,
+    maxWaitSecs: 900,
   },
 };
 
@@ -125,17 +125,17 @@ function mergeConfig(fileConfig: PartialConfig): McpServerConfig {
       port: ollamaPort,
     },
     timeouts: {
-      requestMs: parseNumber(
-        process.env.FREECYCLE_REQUEST_TIMEOUT_MS,
-        fileConfig.timeouts?.requestMs ?? DEFAULT_CONFIG.timeouts.requestMs,
+      requestSecs: parseNumber(
+        process.env.FREECYCLE_REQUEST_TIMEOUT_SECS,
+        fileConfig.timeouts?.requestSecs ?? DEFAULT_CONFIG.timeouts.requestSecs,
       ),
-      inferenceMs: parseNumber(
-        process.env.FREECYCLE_INFERENCE_TIMEOUT_MS,
-        fileConfig.timeouts?.inferenceMs ?? DEFAULT_CONFIG.timeouts.inferenceMs,
+      inferenceSecs: parseNumber(
+        process.env.FREECYCLE_INFERENCE_TIMEOUT_SECS,
+        fileConfig.timeouts?.inferenceSecs ?? DEFAULT_CONFIG.timeouts.inferenceSecs,
       ),
-      pullMs: parseNumber(
-        process.env.FREECYCLE_PULL_TIMEOUT_MS,
-        fileConfig.timeouts?.pullMs ?? DEFAULT_CONFIG.timeouts.pullMs,
+      pullSecs: parseNumber(
+        process.env.FREECYCLE_PULL_TIMEOUT_SECS,
+        fileConfig.timeouts?.pullSecs ?? DEFAULT_CONFIG.timeouts.pullSecs,
       ),
     },
     wakeOnLan: {
@@ -159,19 +159,19 @@ function mergeConfig(fileConfig: PartialConfig): McpServerConfig {
         process.env.FREECYCLE_WOL_PACKET_COUNT,
         fileConfig.wakeOnLan?.packetCount ?? DEFAULT_CONFIG.wakeOnLan.packetCount,
       ),
-      packetIntervalMs: parseNumber(
-        process.env.FREECYCLE_WOL_PACKET_INTERVAL_MS,
-        fileConfig.wakeOnLan?.packetIntervalMs ??
-          DEFAULT_CONFIG.wakeOnLan.packetIntervalMs,
+      packetIntervalSecs: parseNumber(
+        process.env.FREECYCLE_WOL_PACKET_INTERVAL_SECS,
+        fileConfig.wakeOnLan?.packetIntervalSecs ??
+          DEFAULT_CONFIG.wakeOnLan.packetIntervalSecs,
       ),
-      pollIntervalMs: parseNumber(
-        process.env.FREECYCLE_WOL_POLL_INTERVAL_MS,
-        fileConfig.wakeOnLan?.pollIntervalMs ??
-          DEFAULT_CONFIG.wakeOnLan.pollIntervalMs,
+      pollIntervalSecs: parseNumber(
+        process.env.FREECYCLE_WOL_POLL_INTERVAL_SECS,
+        fileConfig.wakeOnLan?.pollIntervalSecs ??
+          DEFAULT_CONFIG.wakeOnLan.pollIntervalSecs,
       ),
-      maxWaitMs: parseNumber(
-        process.env.FREECYCLE_WOL_MAX_WAIT_MS,
-        fileConfig.wakeOnLan?.maxWaitMs ?? DEFAULT_CONFIG.wakeOnLan.maxWaitMs,
+      maxWaitSecs: parseNumber(
+        process.env.FREECYCLE_WOL_MAX_WAIT_SECS,
+        fileConfig.wakeOnLan?.maxWaitSecs ?? DEFAULT_CONFIG.wakeOnLan.maxWaitSecs,
       ),
     },
   };

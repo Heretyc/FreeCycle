@@ -68,7 +68,7 @@ export async function sendWakeOnLanPackets(
   for (let sent = 0; sent < config.packetCount; sent += 1) {
     await sendPacket(packet, config.broadcastAddress, config.port);
     if (sent < config.packetCount - 1) {
-      await sleep(config.packetIntervalMs);
+      await sleep(config.packetIntervalSecs * 1000);
     }
   }
 }

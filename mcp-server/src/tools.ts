@@ -300,7 +300,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_pull_model",
-    "Request download of a new model to the local Ollama instance. Once local readiness succeeds, the tool automatically signals FreeCycle task start and stop around the pull so the tray reflects the active MCP job.",
+    "Request download of a new model through FreeCycle's tray-gated install API. The local user must enable remote model installs from the tray menu first; the unlock automatically expires after one hour. Once local readiness succeeds, the tool automatically signals FreeCycle task start and stop around the pull so the tray reflects the active MCP job.",
     {
       model_name: z
         .string()
@@ -320,7 +320,18 @@ export function registerTools(server: McpServer): void {
           operationLabel: "pull",
           modelName: model_name,
         },
-        () => ollama.pullModel(model_name),
+        async () => {
+          const response = await fc.installModelDetailed(model_name);
+          if (response.ok) {
+            return response.body;
+          }
+
+          return {
+            ok: false,
+            http_status: response.status,
+            message: response.body.message,
+          };
+        },
       );
     },
   );

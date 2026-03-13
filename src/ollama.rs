@@ -4,16 +4,177 @@
 //! via `OLLAMA_HOST`, pulling required models, and periodic model update checks.
 
 use crate::config::FreeCycleConfig;
-use crate::logging::scrub_http_preview;
+use crate::logging::{scrub_http_preview, scrub_http_preview_default};
 use crate::state::{FreeCycleStatus, ManualOverride};
-use crate::AppState;
+use crate::{AppState, ModelProgress, ModelTransferKind};
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, RwLock};
 use tracing::{debug, error, info, warn};
+
+fn log_ollama_request(method: &str, url: &str, body: &str) {
+    let body_preview = scrub_http_preview_default(body);
+    if body_preview.is_empty() {
+        debug!("Ollama HTTP request: {} {}", method, url);
+    } else {
+        debug!(
+            "Ollama HTTP request: {} {} body={}",
+            method, url, body_preview
+        );
+    }
+}
+
+fn log_ollama_transport_error(method: &str, url: &str, error: &reqwest::Error) {
+    debug!(
+        "Ollama HTTP transport failure: {} {} error={}",
+        method, url, error
+    );
+}
+
+async fn read_logged_response_preview(
+    method: &str,
+    url: &str,
+    response: reqwest::Response,
+) -> (reqwest::StatusCode, String) {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let preview = scrub_http_preview_default(&body);
+
+    if preview.is_empty() {
+        debug!("Ollama HTTP response: {} {} status={}", method, url, status);
+    } else {
+        debug!(
+            "Ollama HTTP response: {} {} status={} body={}",
+            method, url, status, preview
+        );
+    }
+
+    (status, body)
+}
+
+#[derive(Debug, Deserialize)]
+struct PullProgressEvent {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    completed: Option<u64>,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn progress_percent(completed: Option<u64>, total: Option<u64>) -> Option<u8> {
+    match (completed, total) {
+        (Some(completed), Some(total)) if total > 0 => {
+            let percent = completed.saturating_mul(100) / total;
+            Some(percent.min(100) as u8)
+        }
+        _ => None,
+    }
+}
+
+fn build_progress_update(
+    model: &str,
+    kind: ModelTransferKind,
+    event: &PullProgressEvent,
+) -> Option<ModelProgress> {
+    if let Some(error) = &event.error {
+        return Some(ModelProgress {
+            model_name: model.to_string(),
+            kind,
+            percent: None,
+            status_text: format!("Failed: {} ({})", model, error.trim()),
+            failed: true,
+        });
+    }
+
+    let status_text = event.status.trim();
+    if status_text.is_empty() && progress_percent(event.completed, event.total).is_none() {
+        return None;
+    }
+
+    let mut progress = ModelProgress::new(model.to_string(), kind);
+    progress.percent = progress_percent(event.completed, event.total);
+    if !status_text.is_empty() {
+        progress.status_text = status_text.to_string();
+    }
+
+    Some(progress)
+}
+
+async fn update_model_progress(
+    state: &Arc<RwLock<AppState>>,
+    model: &str,
+    kind: ModelTransferKind,
+    event: &PullProgressEvent,
+) {
+    if let Some(progress) = build_progress_update(model, kind, event) {
+        let rendered = progress.render_status();
+        if let Some(percent) = progress.percent {
+            info!("Model progress: {} ({}%)", model, percent);
+        } else if !progress.failed {
+            info!("Model progress: {}", rendered);
+        }
+
+        let mut shared = state.write().await;
+        shared.upsert_model_progress(progress);
+    }
+}
+
+async fn process_pull_stream_chunk(
+    state: &Arc<RwLock<AppState>>,
+    model: &str,
+    kind: ModelTransferKind,
+    buffer: &mut String,
+) {
+    while let Some(newline_index) = buffer.find('\n') {
+        let line = buffer[..newline_index].trim().to_string();
+        buffer.drain(..=newline_index);
+
+        if line.is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<PullProgressEvent>(&line) {
+            Ok(event) => update_model_progress(state, model, kind, &event).await,
+            Err(error) => {
+                warn!(
+                    "Failed to parse Ollama pull progress event for {}: {}",
+                    model, error
+                );
+                debug!("Malformed Ollama pull progress payload: {}", line);
+            }
+        }
+    }
+}
+
+async fn process_pull_stream_tail(
+    state: &Arc<RwLock<AppState>>,
+    model: &str,
+    kind: ModelTransferKind,
+    buffer: &str,
+) {
+    let line = buffer.trim();
+    if line.is_empty() {
+        return;
+    }
+
+    match serde_json::from_str::<PullProgressEvent>(line) {
+        Ok(event) => update_model_progress(state, model, kind, &event).await,
+        Err(error) => {
+            warn!(
+                "Failed to parse final Ollama pull progress event for {}: {}",
+                model, error
+            );
+            debug!("Malformed final Ollama pull progress payload: {}", line);
+        }
+    }
+}
 
 /// Checks whether Ollama is installed on the system.
 ///
@@ -334,33 +495,37 @@ pub async fn run_model_manager(
             let model_exists = check_model_exists(&base_url, model).await;
 
             if !model_exists || should_update {
-                let action = if model_exists {
-                    "Updating"
+                let kind = if model_exists {
+                    ModelTransferKind::Updating
                 } else {
-                    "Downloading"
+                    ModelTransferKind::Downloading
                 };
-                info!("{} model: {}", action, model);
+                info!("{} model: {}", kind.label(), model);
 
                 {
                     let mut s = state.write().await;
-                    s.models_downloading = true;
-                    s.model_status.push(format!("{}: {}", action, model));
+                    s.upsert_model_progress(ModelProgress::new(model.clone(), kind));
                 }
 
-                match pull_model(&base_url, model).await {
+                match pull_model(Arc::clone(&state), &base_url, model, kind).await {
                     Ok(()) => {
                         info!("Model {} is ready", model);
                         let mut s = state.write().await;
-                        s.model_status.retain(|m| !m.contains(model));
+                        s.remove_model_progress(model);
                     }
                     Err(e) => {
                         warn!("Failed to pull model {}: {}", model, e);
                         let mut s = state.write().await;
-                        s.model_status.retain(|m| !m.contains(model));
-                        s.model_status.push(format!(
-                            "Failed: {} (retrying in {}m)",
-                            model, config.models.retry_interval_minutes
-                        ));
+                        s.upsert_model_progress(ModelProgress {
+                            model_name: model.clone(),
+                            kind,
+                            percent: None,
+                            status_text: format!(
+                                "Failed: {} (retrying in {}m)",
+                                model, config.models.retry_interval_minutes
+                            ),
+                            failed: true,
+                        });
                     }
                 }
             }
@@ -368,15 +533,6 @@ pub async fn run_model_manager(
 
         if should_update {
             last_update_check = std::time::Instant::now();
-        }
-
-        // Clear downloading flag if no more models in progress
-        {
-            let mut s = state.write().await;
-            s.models_downloading = s
-                .model_status
-                .iter()
-                .any(|m| m.starts_with("Downloading") || m.starts_with("Updating"));
         }
 
         // Wait for next check
@@ -403,10 +559,30 @@ async fn check_model_exists(base_url: &str, model: &str) -> bool {
     let url = format!("{}/api/show", base_url);
     let client = reqwest::Client::new();
     let body = serde_json::json!({ "name": model });
+    log_ollama_request("POST", &url, &body.to_string());
 
     match client.post(&url).json(&body).send().await {
-        Ok(resp) => resp.status().is_success(),
-        Err(_) => false,
+        Ok(resp) => {
+            let (status, _) = read_logged_response_preview("POST", &url, resp).await;
+            let exists = status.is_success();
+
+            if exists {
+                debug!("Ollama model lookup succeeded for {}", model);
+            } else if status == reqwest::StatusCode::NOT_FOUND {
+                debug!("Ollama model lookup reported missing model {}", model);
+            } else {
+                debug!(
+                    "Ollama model lookup returned non-success for {}: {}",
+                    model, status
+                );
+            }
+
+            exists
+        }
+        Err(error) => {
+            log_ollama_transport_error("POST", &url, &error);
+            false
+        }
     }
 }
 
@@ -423,7 +599,12 @@ async fn check_model_exists(base_url: &str, model: &str) -> bool {
 /// # Returns
 ///
 /// `Ok(())` on success, or an error if the pull failed.
-async fn pull_model(base_url: &str, model: &str) -> Result<()> {
+pub async fn pull_model(
+    state: Arc<RwLock<AppState>>,
+    base_url: &str,
+    model: &str,
+    kind: ModelTransferKind,
+) -> Result<()> {
     let url = format!("{}/api/pull", base_url);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3600))
@@ -431,23 +612,48 @@ async fn pull_model(base_url: &str, model: &str) -> Result<()> {
 
     let body = serde_json::json!({
         "name": model,
-        "stream": false
+        "stream": true
     });
+    log_ollama_request("POST", &url, &body.to_string());
 
     let resp = client
         .post(&url)
         .json(&body)
         .send()
         .await
+        .map_err(|error| {
+            log_ollama_transport_error("POST", &url, &error);
+            error
+        })
         .context("Failed to send pull request")?;
 
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        let status = resp.status();
+    let status = resp.status();
+    debug!(
+        "Ollama HTTP response: POST {} status={} body=<stream>",
+        url, status
+    );
+
+    if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("{}", format_http_error("Pull failed", status, &body))
     }
+
+    let mut response = resp;
+    let mut buffer = String::new();
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("Failed to read pull stream")?
+    {
+        let chunk_text = String::from_utf8_lossy(&chunk);
+        buffer.push_str(&chunk_text);
+        process_pull_stream_chunk(&state, model, kind, &mut buffer).await;
+    }
+
+    process_pull_stream_tail(&state, model, kind, &buffer).await;
+
+    Ok(())
 }
 
 fn format_http_error(context: &str, status: reqwest::StatusCode, body: &str) -> String {
@@ -491,5 +697,75 @@ mod tests {
         assert!(message.contains("[REDACTED]"));
         assert!(!message.contains("secret123"));
         assert!(!message.contains("abc123"));
+    }
+
+    #[test]
+    fn test_log_ollama_request_redacts_sensitive_request_text() {
+        let body = r#"{"name":"llama3.1:8b-instruct-q4_K_M","token":"secret123"}"#;
+        let preview = scrub_http_preview_default(body);
+        assert!(preview.contains("[REDACTED]"));
+        assert!(!preview.contains("secret123"));
+    }
+
+    #[test]
+    fn test_build_progress_update_prefers_percentage_when_available() {
+        let event = PullProgressEvent {
+            status: "pulling manifest".to_string(),
+            completed: Some(25),
+            total: Some(100),
+            error: None,
+        };
+
+        let progress = build_progress_update(
+            "llama3.1:8b-instruct-q4_K_M",
+            ModelTransferKind::Downloading,
+            &event,
+        )
+        .unwrap();
+
+        assert_eq!(progress.percent, Some(25));
+        assert_eq!(
+            progress.render_status(),
+            "Downloading llama3.1:8b-instruct-q4_K_M: 25%"
+        );
+    }
+
+    #[test]
+    fn test_build_progress_update_uses_status_fallback_without_totals() {
+        let event = PullProgressEvent {
+            status: "resolving manifest".to_string(),
+            completed: None,
+            total: None,
+            error: None,
+        };
+
+        let progress =
+            build_progress_update("nomic-embed-text", ModelTransferKind::Updating, &event).unwrap();
+
+        assert_eq!(progress.percent, None);
+        assert_eq!(
+            progress.render_status(),
+            "Updating nomic-embed-text: resolving manifest"
+        );
+    }
+
+    #[test]
+    fn test_build_progress_update_formats_failures() {
+        let event = PullProgressEvent {
+            status: String::new(),
+            completed: None,
+            total: None,
+            error: Some("disk full".to_string()),
+        };
+
+        let progress =
+            build_progress_update("nomic-embed-text", ModelTransferKind::Downloading, &event)
+                .unwrap();
+
+        assert!(progress.failed);
+        assert_eq!(
+            progress.render_status(),
+            "Failed: nomic-embed-text (disk full)"
+        );
     }
 }

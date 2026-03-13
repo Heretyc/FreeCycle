@@ -1,7 +1,8 @@
 /**
  * HTTP client for the FreeCycle Agent Signal API (default port 7443).
  *
- * Provides methods for status queries, task lifecycle signaling, and health checks.
+ * Provides methods for status queries, task lifecycle signaling, tray-gated model installs,
+ * and health checks.
  * Uses native fetch (Node 18+). All methods accept an optional baseUrl override.
  */
 
@@ -20,6 +21,8 @@ export interface FreeCycleStatus {
   ollama_port: number;
   blocking_processes: string[];
   model_status: string[];
+  remote_model_installs_unlocked: boolean;
+  remote_model_installs_expires_in_seconds: number | null;
 }
 
 /** Shape returned by POST /task/start and POST /task/stop. */
@@ -55,7 +58,7 @@ function extractResponseMessage(parsed: unknown, fallback: string): string {
 async function requestResponse<T>(
   url: string,
   init?: RequestInit,
-  timeoutMs = getConfig().timeouts.requestMs,
+  timeoutMs = getConfig().timeouts.requestSecs * 1000,
 ): Promise<JsonHttpResponse<T>> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -88,7 +91,7 @@ async function requestResponse<T>(
 async function request<T>(
   url: string,
   init?: RequestInit,
-  timeoutMs = getConfig().timeouts.requestMs,
+  timeoutMs = getConfig().timeouts.requestSecs * 1000,
 ): Promise<T> {
   const response = await requestResponse<T>(url, init, timeoutMs);
   if (!response.ok) {
@@ -170,4 +173,36 @@ export async function stopTaskDetailed(
 export async function healthCheck(baseUrl?: string): Promise<ApiResponse> {
   const base = baseUrl ?? resolveBase();
   return request<ApiResponse>(`${base}/health`);
+}
+
+/** Request a model install through FreeCycle's tray-gated API. */
+export async function installModel(
+  modelName: string,
+  baseUrl?: string,
+): Promise<ApiResponse> {
+  const response = await installModelDetailed(modelName, baseUrl);
+  if (!response.ok) {
+    throw new Error(
+      `HTTP ${response.status} from ${(baseUrl ?? resolveBase())}/models/install: ${response.body.message}`,
+    );
+  }
+
+  return response.body;
+}
+
+/** Request a model install and inspect the HTTP status. */
+export async function installModelDetailed(
+  modelName: string,
+  baseUrl?: string,
+): Promise<JsonHttpResponse<ApiResponse>> {
+  const base = baseUrl ?? resolveBase();
+  return requestResponse<ApiResponse>(
+    `${base}/models/install`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model_name: modelName }),
+    },
+    getConfig().timeouts.pullSecs * 1000,
+  );
 }

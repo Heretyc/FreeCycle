@@ -8,9 +8,9 @@
     "port": 11434
   },
   "timeouts": {
-    "requestMs": 10000,
-    "inferenceMs": 300000,
-    "pullMs": 600000
+    "requestSecs": 10,
+    "inferenceSecs": 300,
+    "pullSecs": 600
   },
   "wakeOnLan": {
     "enabled": false,
@@ -18,8 +18,8 @@
     "broadcastAddress": "255.255.255.255",
     "port": 9,
     "packetCount": 5,
-    "packetIntervalMs": 250,
-    "pollIntervalMs": 30000,
-    "maxWaitMs": 900000
+    "packetIntervalSecs": 0.25,
+    "pollIntervalSecs": 30,
+    "maxWaitSecs": 900
   }
 }

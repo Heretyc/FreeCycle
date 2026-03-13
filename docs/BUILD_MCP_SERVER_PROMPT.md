@@ -125,10 +125,9 @@ Returns the full system state as JSON.
   "local_ip": "192.168.1.10",
   "ollama_port": 11434,
   "blocking_processes": [],
-  "model_status": [
-    "ready: llama3.1:8b-instruct-q4_K_M",
-    "ready: nomic-embed-text"
-  ]
+  "model_status": [],
+  "remote_model_installs_unlocked": false,
+  "remote_model_installs_expires_in_seconds": null
 }
 ```
 
@@ -147,6 +146,8 @@ Returns the full system state as JSON.
 | ollama_port | number | Port Ollama is listening on |
 | blocking_processes | string[] | Process names currently triggering a block |
 | model_status | string[] | Human readable model status messages from FreeCycle |
+| remote_model_installs_unlocked | boolean | `true` while the tray-controlled remote install window is open |
+| remote_model_installs_expires_in_seconds | number or null | Seconds remaining before the tray-controlled remote install window auto-locks, or `null` when locked |
 
 **Model status values:** FreeCycle currently exposes plain status strings rather than a keyed object. Preserve the array shape returned by the API.
 
@@ -229,6 +230,50 @@ Signal that an agent has completed its task. Reverts tray icon to green (or red 
   "message": "Task 'abc-123' not found"
 }
 ```
+
+#### POST /models/install
+
+Install a model through FreeCycle when the local user has enabled the tray menu unlock.
+
+**Request Body:**
+```json
+{
+  "model_name": "qwen2.5-coder:7b"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| model_name | string | yes | Full Ollama model name or tag to install |
+
+**Response (200 OK):**
+```json
+{
+  "ok": true,
+  "message": "Model 'qwen2.5-coder:7b' installed"
+}
+```
+
+**Response (403 Forbidden, tray unlock is off):**
+```json
+{
+  "ok": false,
+  "message": "Remote model installs are locked. Enable the tray menu toggle to allow installs for the next hour."
+}
+```
+
+**Response (409 Conflict, GPU is blocked):**
+```json
+{
+  "ok": false,
+  "message": "GPU is currently Blocked (Game Running)"
+}
+```
+
+**Behavior Notes:**
+- The unlock is controlled only from the FreeCycle tray menu on the GPU machine.
+- The unlock automatically expires after one hour and cannot be extended remotely.
+- Use the official [Ollama Library](https://ollama.com/library) to discover installable model names.
 
 ### 3.2 Ollama REST API
 
@@ -390,6 +435,8 @@ Pull (download) a model.
   "status": "success"
 }
 ```
+
+**Important:** The shipped `freecycle_pull_model` MCP tool does not call `/api/pull` directly anymore. It calls FreeCycle `POST /models/install` so the tray-controlled one-hour unlock remains authoritative for remote installs.
 
 #### DELETE /api/delete
 
@@ -602,7 +649,7 @@ Inspect a specific local model.
 
 #### Tool: `freecycle_pull_model`
 
-Download a model to the local Ollama instance.
+Download a model to the local Ollama instance through FreeCycle's tray-gated install API.
 
 **Input Schema:**
 ```json
@@ -618,7 +665,7 @@ Download a model to the local Ollama instance.
 }
 ```
 
-**Behavior:** Run the shared local-readiness helper first. Then wrap the pull with automatic `POST /task/start` and `POST /task/stop` using a short description such as `MCP pull: <model>`. Use a generous timeout. If task start returns `409`, return a structured local-unavailable result instead of starting the pull.
+**Behavior:** Run the shared local-readiness helper first. Then call FreeCycle `POST /models/install`, not Ollama `POST /api/pull`, so the tray-controlled one-hour unlock is enforced for remote installs. Wrap the full install with automatic `POST /task/start` and `POST /task/stop` using a short description such as `MCP pull: <model>`. Use a generous timeout. If task start returns `409`, return a structured local-unavailable result instead of starting the install. If FreeCycle returns `403`, surface the lock message so the user knows they must unlock remote installs from the tray again.
 
 ### 4.3 Inference and Embedding Tools
 
@@ -1340,11 +1387,13 @@ These are absolute rules. Violating any of these makes the implementation incorr
 
 10. **No ignoring HTTP status codes.** Check response status codes on every API call. A 200 from FreeCycle and a 409 from FreeCycle mean very different things. Parse and relay the appropriate information.
 
-11. **No excessive dependencies.** Use Node.js native `fetch` (Node 18+). Use the official MCP SDK and zod. Do not add axios, node-fetch, got, or similar HTTP libraries unless there is a specific technical need.
+11. **No bypassing the FreeCycle install gate.** The shipped `freecycle_pull_model` workflow must call FreeCycle `POST /models/install`, not Ollama `POST /api/pull`, so the tray-controlled one-hour unlock is always enforced for remote model installs.
 
-12. **No tool names that conflict with built in MCP tools.** All tool names must be prefixed with `freecycle_` or `ollama_` to avoid collisions.
+12. **No excessive dependencies.** Use Node.js native `fetch` (Node 18+). Use the official MCP SDK and zod. Do not add axios, node-fetch, got, or similar HTTP libraries unless there is a specific technical need.
 
-13. **No missing automatic task signaling for local execution tools.** After readiness succeeds, every MCP tool that sends real work to Ollama must wrap that work with `POST /task/start` and `POST /task/stop`. Reserve the manual task tools for custom workflows outside the built-in local execution tools.
+13. **No tool names that conflict with built in MCP tools.** All tool names must be prefixed with `freecycle_` or `ollama_` to avoid collisions.
+
+14. **No missing automatic task signaling for local execution tools.** After readiness succeeds, every MCP tool that sends real work to Ollama must wrap that work with `POST /task/start` and `POST /task/stop`. Reserve the manual task tools for custom workflows outside the built-in local execution tools.
 
 ---
 
@@ -1358,7 +1407,7 @@ When implementation is complete, deliver all of the following files. Each file m
 
 2. **`src/tools.ts`**: Registers all 13 tools: `freecycle_status`, `freecycle_health`, `freecycle_start_task`, `freecycle_stop_task`, `freecycle_check_availability`, `freecycle_list_models`, `freecycle_show_model`, `freecycle_pull_model`, `freecycle_generate`, `freecycle_chat`, `freecycle_embed`, `freecycle_evaluate_task`, and `freecycle_benchmark`.
 
-3. **`src/freecycle-client.ts`**: HTTP client for the FreeCycle Agent API with timeout handling, typed responses, and helpers for start/stop task responses.
+3. **`src/freecycle-client.ts`**: HTTP client for the FreeCycle Agent API with timeout handling, typed responses, helpers for start/stop task responses, and a typed helper for `POST /models/install`.
 
 4. **`src/ollama-client.ts`**: HTTP client for the Ollama API with typed generate/chat/embed/model methods and configurable timeouts.
 
