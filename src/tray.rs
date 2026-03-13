@@ -437,6 +437,7 @@ pub fn run_tray(
     state: Arc<RwLock<AppState>>,
     shutdown_tx: watch::Sender<bool>,
     runtime: &Runtime,
+    lock: &ProcessLock,
 ) -> Result<()> {
     let class_name = to_wide_null("FreeCyclePowerEvents");
     let window_name = to_wide_null("FreeCycle Power Event Window");
@@ -678,6 +679,12 @@ pub fn run_tray(
             } else {
                 // No messages, sleep briefly to avoid busy-waiting
                 std::thread::sleep(Duration::from_millis(50));
+            }
+
+            // Refresh the process lock to prevent expiry while we're running.
+            // Failures are non-fatal: log a warning and keep going.
+            if let Err(e) = lock.refresh() {
+                warn!("Failed to refresh process lock: {}", e);
             }
         }
         Ok(())

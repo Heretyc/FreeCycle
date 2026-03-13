@@ -42,7 +42,7 @@ fn main() -> Result<()> {
         info!("Another instance of FreeCycle is already running. Exiting quietly.");
         return Ok(());
     }
-    let _lock = lock.unwrap();
+    let lock = lock.unwrap();
     info!("Process lock acquired");
 
     // Load configuration
@@ -113,7 +113,7 @@ fn main() -> Result<()> {
     // Run the tray icon on the main thread (required by Windows message pump)
     // This blocks until the user exits via the tray context menu
     info!("Starting system tray interface");
-    tray::run_tray(Arc::clone(&shared_state), shutdown_tx, &runtime)?;
+    tray::run_tray(Arc::clone(&shared_state), shutdown_tx, &runtime, &lock)?;
 
     info!("FreeCycle shutting down");
     Ok(())
