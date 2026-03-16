@@ -6,6 +6,7 @@ rust-version = "1.75"
 description = "GPU-aware Ollama lifecycle manager for Windows. Monitors for games and GPU-intensive programs, automatically enabling/disabling networked Ollama access when the GPU is available."
 license = "Apache-2.0"
 repository = "https://github.com/Heretyc/FreeCycle"
+homepage = "https://github.com/Heretyc/FreeCycle"
 readme = "README.md"
 keywords = ["ollama", "gpu", "windows", "llm", "nvidia"]
 categories = ["command-line-utilities"]
@@ -13,10 +14,17 @@ include = [
     "/src/**",
     "/tests/**",
     "/Cargo.toml",
-    "/Cargo.lock",
     "/README.md",
     "/LICENSE",
 ]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc"]
+
+[lib]
+name = "freecycle"
+path = "src/lib.rs"
 
 [[bin]]
 name = "freecycle"
