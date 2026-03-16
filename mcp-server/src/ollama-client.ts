@@ -95,6 +95,29 @@ export interface PullResponse {
   completed?: number;
 }
 
+export interface DeleteModelResponse {
+  status: string;
+}
+
+export interface CopyModelResponse {
+  status: string;
+}
+
+export interface RunningModel {
+  name: string;
+  model: string;
+  size: number;
+  size_vram: number;
+  digest: string;
+  details?: Record<string, unknown>;
+  expires_at?: string;
+  modified_at?: string;
+}
+
+export interface ListRunningResponse {
+  models: RunningModel[];
+}
+
 export function resolveBase(): string {
   const config = getConfig();
   return `http://${config.ollama.host}:${config.ollama.port}`;
@@ -107,6 +130,7 @@ async function requestJson<T>(
 ): Promise<T> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const method = init?.method ?? "GET";
   try {
     const res = await fetch(url, { ...init, signal: controller.signal });
     const body = await res.text();
@@ -127,6 +151,9 @@ async function requestJson<T>(
         `Request to ${url} timed out after ${Math.round(timeoutMs / 1000)} seconds`,
       );
     }
+    if (err instanceof Error && !err.message.includes("HTTP")) {
+      throw new Error(`${method} ${url}: ${err.message}`);
+    }
     throw err;
   } finally {
     clearTimeout(timeout);
@@ -140,11 +167,22 @@ async function requestText(
 ): Promise<string> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const method = init?.method ?? "GET";
   try {
     const res = await fetch(url, { ...init, signal: controller.signal });
     const body = await res.text();
     if (!res.ok) {
-      throw new Error(`HTTP ${res.status} from ${url}: ${body.slice(0, 300)}`);
+      // Try JSON error extraction first
+      let errorMsg = body.slice(0, 300);
+      try {
+        const parsed = JSON.parse(body) as Record<string, unknown>;
+        if (typeof parsed.error === "string") {
+          errorMsg = parsed.error;
+        }
+      } catch {
+        // Fall back to raw body slice
+      }
+      throw new Error(`HTTP ${res.status} from ${url}: ${errorMsg}`);
     }
 
     return body;
@@ -153,6 +191,9 @@ async function requestText(
       throw new Error(
         `Request to ${url} timed out after ${Math.round(timeoutMs / 1000)} seconds`,
       );
+    }
+    if (err instanceof Error && !err.message.includes("HTTP")) {
+      throw new Error(`${method} ${url}: ${err.message}`);
     }
     throw err;
   } finally {
@@ -267,11 +308,16 @@ export async function showModel(
   return requestJson<ShowModelResponse>(`${base}/api/show`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ model: name }),
   });
 }
 
-/** Pull (download) a model. Non-streaming; waits for completion. */
+/**
+ * Pull (download) a model. Non-streaming; waits for completion.
+ *
+ * Note: Large models (>20 GB) may exceed the default 10-minute timeout.
+ * Consider increasing `timeouts.pullSecs` in the MCP config for very large models.
+ */
 export async function pullModel(
   name: string,
   baseUrl?: string,
@@ -286,4 +332,39 @@ export async function pullModel(
     },
     getConfig().timeouts.pullSecs * 1000,
   );
+}
+
+/** Delete a model by name. */
+export async function deleteModel(
+  name: string,
+  baseUrl?: string,
+): Promise<DeleteModelResponse> {
+  const base = baseUrl ?? resolveBase();
+  return requestJson<DeleteModelResponse>(`${base}/api/delete`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+}
+
+/** Copy (rename) a model from source to destination name. */
+export async function copyModel(
+  source: string,
+  destination: string,
+  baseUrl?: string,
+): Promise<CopyModelResponse> {
+  const base = baseUrl ?? resolveBase();
+  return requestJson<CopyModelResponse>(`${base}/api/copy`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source, destination }),
+  });
+}
+
+/** List all models currently loaded in memory. */
+export async function listRunning(
+  baseUrl?: string,
+): Promise<ListRunningResponse> {
+  const base = baseUrl ?? resolveBase();
+  return requestJson<ListRunningResponse>(`${base}/api/ps`);
 }
