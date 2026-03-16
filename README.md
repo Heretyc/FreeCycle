@@ -168,11 +168,101 @@ curl -X POST http://192.168.1.10:7443/models/install -H "Content-Type: applicati
 
 ## MCP Server
 
-The repository also includes a Node.js MCP server in `mcp-server/`. It loads its network and wake-on-LAN settings from `mcp-server/freecycle-mcp.config.json`.
+The repository includes a Node.js MCP server in `mcp-server/` that exposes FreeCycle and Ollama as tools for Claude Code, OpenAI Codex, and other MCP compatible clients. The server loads configuration from `mcp-server/freecycle-mcp.config.json`.
 
-When a local MCP tool is invoked, the server checks Ollama first. If Ollama is not responding and wake-on-LAN is enabled in that config, it sends multiple magic packets to the configured FreeCycle machine, then polls FreeCycle every 30 seconds by default for up to 15 minutes by default. If local inference still does not become available, the MCP tool reports local unavailability so agent workflows can fall back to cloud models.
+When a local MCP tool is invoked, the server checks Ollama first. If Ollama is not responding and wake-on-LAN is enabled in the config, it sends magic packets to the configured FreeCycle machine and polls FreeCycle every 30 seconds for up to 15 minutes. If local inference becomes unavailable, the MCP tool reports local unavailability so workflows can fall back to cloud models.
 
-The long-running local MCP tools, `freecycle_pull_model`, `freecycle_generate`, `freecycle_chat`, `freecycle_embed`, and `freecycle_benchmark`, automatically call `/task/start` and `/task/stop` so the FreeCycle tray reflects active MCP work. `freecycle_pull_model` now routes through FreeCycle's `/models/install` endpoint instead of calling Ollama `/api/pull` directly, which means the local user must unlock remote model installs from the tray first. The unlock always expires after one hour and must be enabled again interactively from the tray.
+The long-running local MCP tools (`freecycle_pull_model`, `freecycle_generate`, `freecycle_chat`, `freecycle_embed`, `freecycle_benchmark`) automatically call `/task/start` and `/task/stop` so the FreeCycle tray reflects active MCP work. `freecycle_pull_model` routes through FreeCycle's `/models/install` endpoint instead of calling Ollama directly, so the local user must unlock remote model installs from the tray first. The unlock expires after one hour.
+
+### Prerequisites
+
+- Node.js version 18 or later
+
+### Install and Build
+
+1. Install dependencies and build the MCP server:
+
+```bash
+cd mcp-server
+npm install
+npm run build
+```
+
+The compiled MCP server is now in `mcp-server/dist/index.js`.
+
+### Configure
+
+Edit `mcp-server/freecycle-mcp.config.json` to set your FreeCycle and Ollama host/port addresses:
+
+```json
+{
+  "freecycle": {
+    "host": "192.168.1.10",
+    "port": 7443
+  },
+  "ollama": {
+    "host": "192.168.1.10",
+    "port": 11434
+  },
+  "timeouts": {
+    "requestSecs": 10,
+    "inferenceSecs": 300,
+    "pullSecs": 600
+  },
+  "wakeOnLan": {
+    "enabled": false,
+    "macAddress": "",
+    "broadcastAddress": "255.255.255.255"
+  }
+}
+```
+
+Key fields (see `mcp-server/references/config-and-timeouts.md` for full schema):
+- `freecycle.host`, `freecycle.port`: Network address of the FreeCycle server
+- `ollama.host`, `ollama.port`: Network address of the Ollama API
+- `wakeOnLan.enabled`: Set to `true` if you want the MCP server to wake the FreeCycle machine on demand
+- `wakeOnLan.macAddress`: MAC address of the FreeCycle machine (required if WoL is enabled)
+
+### Register with Claude Code
+
+If you have built the MCP server and configured it, register it with Claude Code:
+
+```bash
+claude mcp add freecycle node C:\path\to\freecycle\mcp-server\dist\index.js -e FREECYCLE_MCP_CONFIG=C:\path\to\freecycle\mcp-server\freecycle-mcp.config.json
+```
+
+Adjust the paths to match your FreeCycle repository location.
+
+### Register with OpenAI Codex
+
+Add the server to your Codex `cline_mcp_settings.json` or equivalent config file:
+
+```json
+{
+  "mcpServers": {
+    "freecycle": {
+      "command": "node",
+      "args": ["C:/path/to/freecycle/mcp-server/dist/index.js"],
+      "env": {
+        "FREECYCLE_MCP_CONFIG": "C:/path/to/freecycle/mcp-server/freecycle-mcp.config.json"
+      }
+    }
+  }
+}
+```
+
+### First-Run Verification
+
+After registering the MCP server, ask Claude Code or your MCP client to call the `freecycle_status` tool. A successful response means the MCP server can reach FreeCycle and is ready to use.
+
+### More Information
+
+For detailed configuration, environment variable overrides, timeouts, tool descriptions, and troubleshooting, see:
+- `mcp-server/RAG_INDEX.md`: Token-conscious index of all MCP reference files
+- `mcp-server/references/setup-and-registration.md`: Detailed setup and registration steps
+- `mcp-server/references/config-and-timeouts.md`: Complete configuration schema
+- `mcp-server/references/tools-and-routing.md`: Tool list and readiness behavior
+- `mcp-server/references/failure-recovery.md`: Troubleshooting guide
 
 ## Development
 
