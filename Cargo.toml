@@ -1,10 +1,12 @@
 [package]
 name = "freecycle"
-version = "1.0.1"
+version = "1.0.51"
 edition = "2021"
 rust-version = "1.75"
 description = "GPU-aware Ollama lifecycle manager for Windows. Monitors for games and GPU-intensive programs, automatically enabling/disabling networked Ollama access when the GPU is available."
 license = "Apache-2.0"
+authors = ["Heretyc"]
+documentation = "https://docs.rs/freecycle"
 repository = "https://github.com/Heretyc/FreeCycle"
 homepage = "https://github.com/Heretyc/FreeCycle"
 readme = "README.md"
@@ -51,6 +53,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_System_Power",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
 ] }
 
 # Async runtime
@@ -70,10 +74,13 @@ serde_json = "1"
 toml = "0.8"
 
 # HTTP client (for Ollama API)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # HTTP server (for agent signal endpoint)
 axum = "0.7"
+
+# TLS support for agent server
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 
 # Error handling
 anyhow = "1"
@@ -90,6 +97,36 @@ local-ip-address = "0.6"
 
 # Credential scrubbing in logs
 regex-lite = "0.1"
+
+# Ed25519 cryptography for secure mode
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+pkcs8 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# TLS certificate generation
+rcgen = "0.13"
+pem = "3.0"
+
+# UUID generation for server identity
+uuid = { version = "1", features = ["v4"] }
+
+# Base64 encoding for public key representation
+base64 = "0.22"
+
+# SHA-256 hashing for TLS cert fingerprint
+sha2 = "0.10"
+
+# HTML parsing for model catalog scraping
+scraper = "0.21"
+
+# SQLite (bundled) for reading/writing Ollama app settings
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# TLS crypto provider (ring backend)
+rustls = { version = "0.23", features = ["ring"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

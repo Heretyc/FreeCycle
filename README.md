@@ -17,6 +17,7 @@ FreeCycle sits in your Windows system tray and watches for GPU-intensive games a
 - Waits 60 seconds after Windows resume before re-enabling Ollama (configurable)
 - Provides an HTTP API (port 7443) for external agents to signal GPU task start/stop
 - Color-coded tray icon: green (available), red (blocked), blue (agent task), yellow (downloading), grey (error)
+- Automatic Windows notifications on state transitions (blocked, available, etc.)
 - Self-registers for Windows auto-start; disables Ollama's own auto-start
 - Single-instance enforcement via lockfile
 
@@ -130,11 +131,21 @@ External agentic workflows can signal task start/stop to FreeCycle via HTTP. Thi
 ### Endpoints
 
 **GET /status**
-Returns current FreeCycle status as JSON.
+Returns current FreeCycle status as JSON. Response body includes:
 
-Current status responses also include:
+- `status`: Current status label (`Available`, `Blocked`, `Cooldown`, `WakeDelay`, `AgentTaskActive`, `Downloading`, `Error`, or `Initializing`)
+- `ollama_running`: Whether Ollama is currently running
+- `vram_used_mb`: VRAM used in megabytes
+- `vram_total_mb`: Total VRAM in megabytes
+- `vram_percent`: VRAM usage as a percentage (0-100)
+- `active_task_id`: Current agent task ID, if any
+- `active_task_description`: Current agent task description, if any
+- `local_ip`: FreeCycle's local IP address
+- `ollama_port`: Ollama listening port (default 11434)
+- `blocking_processes`: List of process names currently blocking the GPU
+- `model_status`: List of model download/update status messages
 - `remote_model_installs_unlocked`: `true` while the tray-controlled install window is open
-- `remote_model_installs_expires_in_seconds`: seconds remaining before the install window auto-locks again, or `null` when locked
+- `remote_model_installs_expires_in_seconds`: Seconds remaining before the install window auto-locks, or `null` when locked
 
 **POST /task/start**
 ```json

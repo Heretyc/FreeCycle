@@ -68,6 +68,10 @@ pub struct FreeCycleConfig {
     /// Agent signal server settings.
     #[serde(default)]
     pub agent_server: AgentServerConfig,
+
+    /// Security configuration for cryptographic and identity settings.
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 /// General operational timing and threshold settings.
@@ -113,7 +117,11 @@ pub struct GeneralConfig {
 ///
 /// # Fields
 ///
-/// * `host` - The host address Ollama binds to when exposed (default: "0.0.0.0").
+/// * `host` - The host address Ollama binds to in compatibility mode (default: "0.0.0.0"). Ignored in secure mode.
+/// * `secure_host` - The loopback address Ollama binds to in secure mode (default: "127.0.0.1").
+///   Change to e.g. "127.0.0.2" to prevent other local applications from discovering Ollama
+///   on the standard `localhost`/`127.0.0.1` address. All 127.x.x.x addresses are valid
+///   loopback addresses on Windows and require no additional network configuration.
 /// * `port` - The port Ollama listens on (default: 11434).
 /// * `graceful_shutdown_timeout_seconds` - Seconds to wait for graceful shutdown before force kill (default: 10).
 /// * `exe_path` - Optional explicit path to the ollama executable.
@@ -121,6 +129,9 @@ pub struct GeneralConfig {
 pub struct OllamaConfig {
     #[serde(default = "default_ollama_host")]
     pub host: String,
+
+    #[serde(default = "default_ollama_secure_host")]
+    pub secure_host: String,
 
     #[serde(default = "default_ollama_port")]
     pub port: u16,
@@ -168,6 +179,8 @@ pub struct ProcessList {
 ///
 /// * `port` - The port the agent signal HTTP server listens on (default: 7443).
 /// * `bind_address` - The address to bind to (default: "0.0.0.0").
+/// * `compatibility_mode` - If false (default), secure mode is active (TLS, Ollama bound to 127.0.0.1).
+///   If true, plaintext HTTP and Ollama exposed on 0.0.0.0 (legacy behavior).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentServerConfig {
     #[serde(default = "default_agent_port")]
@@ -175,6 +188,32 @@ pub struct AgentServerConfig {
 
     #[serde(default = "default_agent_bind")]
     pub bind_address: String,
+
+    #[serde(default = "default_compatibility_mode")]
+    pub compatibility_mode: bool,
+}
+
+/// Security configuration for keypair, certificate, and identity settings.
+///
+/// # Fields
+///
+/// * `keypair_path` - Optional path to Ed25519 keypair files (default: alongside config.toml).
+/// * `cert_path` - Optional path to TLS certificate file (default: alongside config.toml).
+/// * `identity_uuid` - Optional UUID for server identity (default: auto-generated on first run).
+/// * `fingerprint_override` - Optional manual GPU fingerprint override (default: derived from NVML).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    #[serde(default)]
+    pub keypair_path: Option<String>,
+
+    #[serde(default)]
+    pub cert_path: Option<String>,
+
+    #[serde(default)]
+    pub identity_uuid: Option<String>,
+
+    #[serde(default)]
+    pub fingerprint_override: Option<String>,
 }
 
 // Default value functions for serde
@@ -206,6 +245,9 @@ fn default_wake_delay_seconds() -> u64 {
 fn default_ollama_host() -> String {
     "0.0.0.0".to_string()
 }
+fn default_ollama_secure_host() -> String {
+    "127.0.0.1".to_string()
+}
 fn default_ollama_port() -> u16 {
     11434
 }
@@ -217,6 +259,9 @@ fn default_agent_port() -> u16 {
 }
 fn default_agent_bind() -> String {
     "0.0.0.0".to_string()
+}
+fn default_compatibility_mode() -> bool {
+    false
 }
 
 fn default_required_models() -> Vec<String> {
@@ -282,6 +327,7 @@ impl Default for OllamaConfig {
     fn default() -> Self {
         Self {
             host: default_ollama_host(),
+            secure_host: default_ollama_secure_host(),
             port: default_ollama_port(),
             graceful_shutdown_timeout_seconds: default_graceful_shutdown_timeout(),
             exe_path: None,
@@ -304,6 +350,7 @@ impl Default for AgentServerConfig {
         Self {
             port: default_agent_port(),
             bind_address: default_agent_bind(),
+            compatibility_mode: default_compatibility_mode(),
         }
     }
 }
@@ -317,6 +364,7 @@ impl Default for FreeCycleConfig {
             blacklisted_processes: default_blacklisted_processes(),
             whitelisted_processes: default_whitelisted_processes(),
             agent_server: AgentServerConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -540,5 +588,115 @@ bind_address = "127.0.0.1"
     fn test_config_dir_exists() {
         let dir = config_dir();
         assert!(dir.to_string_lossy().contains("FreeCycle"));
+    }
+
+    #[test]
+    fn test_compatibility_mode_defaults_to_false() {
+        let partial = r#"
+[agent_server]
+"#;
+        let config: FreeCycleConfig = toml::from_str(partial).unwrap();
+        assert_eq!(config.agent_server.compatibility_mode, false);
+    }
+
+    #[test]
+    fn test_compatibility_mode_round_trip() {
+        let mut config = FreeCycleConfig::default();
+        config.agent_server.compatibility_mode = true;
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: FreeCycleConfig = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.agent_server.compatibility_mode, true);
+        assert_eq!(deserialized.agent_server.port, config.agent_server.port);
+        assert_eq!(
+            deserialized.agent_server.bind_address,
+            config.agent_server.bind_address
+        );
+    }
+
+    #[test]
+    fn test_security_section_defaults() {
+        // Empty [security] block should deserialize to all None.
+        let empty_security = r#"
+[security]
+"#;
+        let config: FreeCycleConfig = toml::from_str(empty_security).unwrap();
+        assert_eq!(config.security.keypair_path, None);
+        assert_eq!(config.security.cert_path, None);
+        assert_eq!(config.security.identity_uuid, None);
+        assert_eq!(config.security.fingerprint_override, None);
+
+        // Completely missing security section should also deserialize to all None.
+        let no_security = r#"
+[general]
+"#;
+        let config: FreeCycleConfig = toml::from_str(no_security).unwrap();
+        assert_eq!(config.security.keypair_path, None);
+        assert_eq!(config.security.cert_path, None);
+        assert_eq!(config.security.identity_uuid, None);
+        assert_eq!(config.security.fingerprint_override, None);
+    }
+
+    #[test]
+    fn test_security_section_round_trip() {
+        let mut config = FreeCycleConfig::default();
+        config.security.keypair_path = Some("/etc/freecycle/keypair.pem".to_string());
+        config.security.cert_path = Some("/etc/freecycle/cert.pem".to_string());
+        config.security.identity_uuid = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
+        config.security.fingerprint_override = Some("gpu-fingerprint-123".to_string());
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: FreeCycleConfig = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            deserialized.security.keypair_path,
+            Some("/etc/freecycle/keypair.pem".to_string())
+        );
+        assert_eq!(
+            deserialized.security.cert_path,
+            Some("/etc/freecycle/cert.pem".to_string())
+        );
+        assert_eq!(
+            deserialized.security.identity_uuid,
+            Some("550e8400-e29b-41d4-a716-446655440000".to_string())
+        );
+        assert_eq!(
+            deserialized.security.fingerprint_override,
+            Some("gpu-fingerprint-123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_security_keypair_path_none_omitted() {
+        // Default config with all security fields None should not emit those keys when serialized.
+        let config = FreeCycleConfig::default();
+        let serialized = toml::to_string_pretty(&config).unwrap();
+
+        // Verify that None values are not serialized as explicit keys.
+        assert!(!serialized.contains("keypair_path"));
+        assert!(!serialized.contains("cert_path"));
+        assert!(!serialized.contains("identity_uuid"));
+        assert!(!serialized.contains("fingerprint_override"));
+    }
+
+    #[test]
+    fn test_security_fingerprint_override_round_trip() {
+        let mut config = FreeCycleConfig::default();
+        config.security.fingerprint_override = Some("custom-gpu-fingerprint".to_string());
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("fingerprint_override"));
+        assert!(serialized.contains("custom-gpu-fingerprint"));
+
+        let deserialized: FreeCycleConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.security.fingerprint_override,
+            Some("custom-gpu-fingerprint".to_string())
+        );
+        // Other security fields should remain None.
+        assert_eq!(deserialized.security.keypair_path, None);
+        assert_eq!(deserialized.security.cert_path, None);
+        assert_eq!(deserialized.security.identity_uuid, None);
     }
 }

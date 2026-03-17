@@ -18,7 +18,7 @@ Prefer specialized models per stage when the quality gain is material, such as a
 
 Use this loop when the installed models are not an obvious fit, or when the evaluation remains low confidence after the first pass:
 
-1. Browse the official [Ollama Library](https://ollama.com/library) and shortlist 2 to 4 candidate models for each critical workflow stage.
+1. Use the `freecycle_model_catalog` tool to shortlist 2 to 4 candidate models for each critical workflow stage.
 2. Include at least one conservative option likely to fit the current VRAM budget and one stronger option if the hardware can support it.
 3. Check `freecycle_status` for `remote_model_installs_unlocked`.
 4. If remote installs are locked, tell the user the GPU machine owner must enable the tray's one-hour remote install unlock before remote pulls can succeed.
@@ -85,7 +85,7 @@ When the workflow has multiple stages, benchmark each stage separately before be
 
 ## Suggesting Additional Local Models
 
-When the user wants to improve local quality instead of routing to cloud, inspect the [Ollama Library](https://ollama.com/library) and suggest models that match the workload and hardware budget.
+When the user wants to improve local quality instead of routing to cloud, use the `freecycle_model_catalog` tool and suggest models that match the workload and hardware budget.
 
 Typical patterns:
 

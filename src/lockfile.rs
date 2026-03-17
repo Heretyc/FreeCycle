@@ -1,13 +1,21 @@
 //! Process lock file management for FreeCycle.
 //!
 //! Prevents multiple instances of FreeCycle from running simultaneously.
-//! Uses a lockfile with a timestamp at `%APPDATA%\FreeCycle\freecycle.lock`.
+//! Uses a lockfile with the owning PID and timestamp at
+//! `%APPDATA%\FreeCycle\freecycle.lock`.
 //! The lock automatically expires after 30 seconds to handle stale locks
-//! from crashed instances.
+//! from crashed or frozen instances.
+//!
+//! Lock file format (one value per line):
+//! ```text
+//! {pid}
+//! {unix_timestamp_secs}
+//! ```
 
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
+use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
@@ -52,6 +60,9 @@ impl ProcessLock {
     /// 30 seconds), creates a new lockfile and returns `Some(ProcessLock)`.
     /// If a valid (non-expired) lockfile exists, returns `None`.
     ///
+    /// When taking over a stale lock that contains a PID, the old process is
+    /// killed via `taskkill /F` to free any ports it may be holding.
+    ///
     /// # Returns
     ///
     /// * `Ok(Some(ProcessLock))` - Lock acquired successfully.
@@ -71,7 +82,7 @@ impl ProcessLock {
         if path.exists() {
             match fs::read_to_string(&path) {
                 Ok(contents) => {
-                    if let Ok(timestamp) = contents.trim().parse::<u64>() {
+                    if let Some((old_pid, timestamp)) = parse_lock(&contents) {
                         let now = current_timestamp();
                         let age = now.saturating_sub(timestamp);
                         if age < LOCK_EXPIRY_SECONDS {
@@ -83,6 +94,10 @@ impl ProcessLock {
                             return Ok(None);
                         }
                         info!("Stale lock detected (age: {}s). Taking over.", age);
+                        // Kill the old process to free its ports before we bind
+                        if let Some(pid) = old_pid {
+                            kill_old_process(pid);
+                        }
                     } else {
                         warn!("Corrupted lockfile. Removing and re-acquiring.");
                     }
@@ -125,7 +140,69 @@ impl Drop for ProcessLock {
     }
 }
 
-/// Writes the current timestamp to the lockfile.
+/// Parses the lock file contents.
+///
+/// Supports two formats:
+/// - New format: two lines — `{pid}\n{timestamp}`
+/// - Legacy format: single line — `{timestamp}` (no PID available)
+///
+/// Returns `Some((Option<pid>, timestamp))` on success, `None` on parse error.
+fn parse_lock(contents: &str) -> Option<(Option<u32>, u64)> {
+    let mut lines = contents.trim().lines();
+    let first = lines.next()?.trim();
+
+    if let Some(second) = lines.next() {
+        // New format: pid\ntimestamp
+        let pid: u32 = first.parse().ok()?;
+        let timestamp: u64 = second.trim().parse().ok()?;
+        Some((Some(pid), timestamp))
+    } else {
+        // Legacy format: just a timestamp
+        let timestamp: u64 = first.parse().ok()?;
+        Some((None, timestamp))
+    }
+}
+
+/// Kills a stale FreeCycle process by PID to release its held ports.
+///
+/// Uses sysinfo to verify the process exists, then `taskkill /F /PID` to
+/// forcibly terminate it, then waits 2 seconds for the OS to release the port.
+fn kill_old_process(pid: u32) {
+    // Don't kill ourselves
+    if pid == process::id() {
+        return;
+    }
+
+    info!("Killing stale FreeCycle process (PID {}) to free port", pid);
+
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
+
+    if sys.process(sysinfo::Pid::from_u32(pid)).is_none() {
+        debug!("Old process PID {} no longer exists, skipping kill", pid);
+        return;
+    }
+
+    match std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            info!("Killed stale FreeCycle process (PID {})", pid);
+            // Wait briefly for the OS to release the port
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("taskkill failed for PID {}: {}", pid, stderr.trim());
+        }
+        Err(e) => {
+            warn!("Failed to run taskkill for PID {}: {}", pid, e);
+        }
+    }
+}
+
+/// Writes the current PID and timestamp to the lockfile.
 ///
 /// # Arguments
 ///
@@ -135,8 +212,10 @@ impl Drop for ProcessLock {
 ///
 /// Returns an error if the file cannot be written.
 fn write_lock(path: &PathBuf) -> Result<()> {
-    let timestamp = current_timestamp().to_string();
-    fs::write(path, &timestamp)
+    let pid = process::id();
+    let timestamp = current_timestamp();
+    let content = format!("{}\n{}", pid, timestamp);
+    fs::write(path, &content)
         .with_context(|| format!("Failed to write lockfile: {}", path.display()))?;
     Ok(())
 }
@@ -167,5 +246,26 @@ mod tests {
     #[test]
     fn test_lock_expiry_constant() {
         assert_eq!(LOCK_EXPIRY_SECONDS, 30);
+    }
+
+    #[test]
+    fn test_parse_lock_new_format() {
+        let contents = "12345\n1704067200\n";
+        let result = parse_lock(contents);
+        assert_eq!(result, Some((Some(12345), 1704067200)));
+    }
+
+    #[test]
+    fn test_parse_lock_legacy_format() {
+        let contents = "1704067200\n";
+        let result = parse_lock(contents);
+        assert_eq!(result, Some((None, 1704067200)));
+    }
+
+    #[test]
+    fn test_parse_lock_corrupted() {
+        assert_eq!(parse_lock("not a number"), None);
+        assert_eq!(parse_lock(""), None);
+        assert_eq!(parse_lock("abc\n123"), None);
     }
 }

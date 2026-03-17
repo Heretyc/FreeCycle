@@ -8,6 +8,7 @@ use crate::logging::{scrub_http_preview, scrub_http_preview_default};
 use crate::state::{FreeCycleStatus, ManualOverride};
 use crate::{AppState, ModelProgress, ModelTransferKind};
 use anyhow::{Context, Result};
+use rusqlite;
 use serde::Deserialize;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -253,7 +254,13 @@ fn find_ollama_exe(config: &FreeCycleConfig) -> Option<String> {
 async fn start_ollama(config: &FreeCycleConfig) -> Result<Child> {
     let exe = find_ollama_exe(config).context("Ollama executable not found")?;
 
-    let host_value = format!("{}:{}", config.ollama.host, config.ollama.port);
+    let effective_host = if config.agent_server.compatibility_mode {
+        config.ollama.host.as_str() // "0.0.0.0" by default in compatibility mode
+    } else {
+        config.ollama.secure_host.as_str() // secure mode: loopback only (default 127.0.0.1)
+    };
+
+    let host_value = format!("{}:{}", effective_host, config.ollama.port);
     info!(
         "Starting Ollama: {} serve (OLLAMA_HOST={})",
         exe, host_value
@@ -319,16 +326,75 @@ async fn stop_ollama(child: &mut Child, timeout_secs: u64) {
 
 /// Kills any existing Ollama processes (for clean startup).
 ///
-/// Uses `taskkill` to find and terminate `ollama.exe` and `ollama_llama_server.exe`.
-fn kill_existing_ollama() {
+/// Terminates `ollama app.exe` (the Ollama tray manager), `ollama.exe` (the
+/// CLI/server), and `ollama_llama_server.exe` (the LLM backend). Killing the
+/// tray app is required to prevent it from re-exposing Ollama on 0.0.0.0
+/// after FreeCycle starts it securely on 127.0.0.1.
+///
+/// A short wait after the kill ensures file handles (including the SQLite
+/// database lock) are released before any subsequent operations.
+pub fn kill_existing_ollama() {
     debug!("Checking for existing Ollama processes to clean up");
-    for process_name in &["ollama.exe", "ollama_llama_server.exe"] {
+    for process_name in &["ollama app.exe", "ollama.exe", "ollama_llama_server.exe"] {
         let _ = std::process::Command::new("taskkill")
             .args(["/F", "/IM", process_name])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .output();
     }
+    // Brief pause so the OS releases file handles (including the SQLite lock)
+    // before callers attempt to open Ollama's settings database.
+    std::thread::sleep(Duration::from_millis(500));
+}
+
+/// Disables the "Expose on Network" setting in Ollama's settings database.
+///
+/// Ollama's tray app (`ollama app.exe`) stores a boolean `expose` flag in
+/// `%LOCALAPPDATA%\Ollama\db.sqlite`. When `expose = 1`, the tray re-binds
+/// Ollama to `0.0.0.0` every time it (re)starts the server, overriding
+/// FreeCycle's localhost-only configuration.
+///
+/// This function sets `expose = 0` so that even if the tray app runs, it
+/// will not override the secure localhost binding.
+///
+/// Must be called **after** `kill_existing_ollama()` so the database file
+/// lock has been released.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened or written. If the
+/// database does not exist, returns `Ok(())` (Ollama not yet configured).
+pub fn disable_ollama_network_exposure() -> Result<()> {
+    let db_path = dirs::data_local_dir()
+        .context("Cannot locate %LOCALAPPDATA%")?
+        .join("Ollama")
+        .join("db.sqlite");
+
+    if !db_path.exists() {
+        debug!(
+            "Ollama settings database not found at {} — skipping",
+            db_path.display()
+        );
+        return Ok(());
+    }
+
+    let conn = rusqlite::Connection::open(&db_path)
+        .with_context(|| format!("Failed to open Ollama database: {}", db_path.display()))?;
+
+    let rows_updated = conn
+        .execute("UPDATE settings SET expose = 0 WHERE expose != 0", [])
+        .with_context(|| "Failed to update Ollama network exposure setting")?;
+
+    if rows_updated > 0 {
+        info!(
+            "Disabled Ollama network exposure in {}",
+            db_path.display()
+        );
+    } else {
+        debug!("Ollama network exposure was already disabled");
+    }
+
+    Ok(())
 }
 
 /// Runs the Ollama lifecycle manager.
@@ -488,7 +554,7 @@ pub async fn run_model_manager(
         }
 
         let should_update = last_update_check.elapsed() > update_interval;
-        let base_url = format!("http://127.0.0.1:{}", config.ollama.port);
+        let base_url = format!("http://{}:{}", config.ollama.secure_host, config.ollama.port);
 
         for model in &required_models {
             // Check if model exists

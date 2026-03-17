@@ -7,11 +7,11 @@ Load this reference when the user asks for concrete code or configuration patter
 ```python
 import requests
 
-FREECYCLE_URL = "http://localhost:7443"
-OLLAMA_URL = "http://localhost:11434"
+FREECYCLE_URL = "https://localhost:7443"
+FREECYCLE_INFERENCE_URL = "https://localhost:7443"
 
 def get_freecycle_status():
-    """Check if FreeCycle reports Ollama as available."""
+    """Check if FreeCycle reports the local inference engine as available."""
     try:
         resp = requests.get(f"{FREECYCLE_URL}/status", timeout=2)
         data = resp.json()
@@ -21,15 +21,15 @@ def get_freecycle_status():
 
 def generate(prompt, prefer_local=True):
     """Generate a response, routing to local or cloud based on availability."""
-    ollama_available, status = get_freecycle_status()
+    local_available, status = get_freecycle_status()
 
-    if prefer_local and ollama_available:
+    if prefer_local and local_available:
         requests.post(f"{FREECYCLE_URL}/task/start", json={
             "task_id": "agent-gen-001",
             "description": "Generating response"
         })
         try:
-            resp = requests.post(f"{OLLAMA_URL}/api/generate", json={
+            resp = requests.post(f"{FREECYCLE_INFERENCE_URL}/api/generate", json={
                 "model": "llama3.1:8b-instruct-q4_K_M",
                 "prompt": prompt,
                 "stream": False
@@ -66,9 +66,9 @@ Example `freecycle-mcp.config.json` for a remote FreeCycle host with wake-on-LAN
     "host": "192.168.1.10",
     "port": 7443
   },
-  "ollama": {
+  "inference": {
     "host": "192.168.1.10",
-    "port": 11434
+    "port": 7443
   },
   "wakeOnLan": {
     "enabled": true,
@@ -118,10 +118,10 @@ import time
 class FreeCycleAgent:
     """Agent that checks FreeCycle health before each operation."""
 
-    def __init__(self, freecycle_url="http://localhost:7443",
-                 ollama_url="http://localhost:11434"):
+    def __init__(self, freecycle_url="https://localhost:7443",
+                 inference_url="https://localhost:7443"):
         self.freecycle_url = freecycle_url
-        self.ollama_url = ollama_url
+        self.inference_url = inference_url
         self.task_id = f"agent-{int(time.time())}"
 
     def is_local_available(self):

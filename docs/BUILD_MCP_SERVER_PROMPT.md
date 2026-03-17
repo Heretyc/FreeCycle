@@ -6,13 +6,13 @@ You are a senior full-stack engineer tasked with building a Model Context Protoc
 
 ### What is FreeCycle?
 
-FreeCycle is a Windows 11 system tray application (written in Rust) that monitors NVIDIA GPU usage and manages the Ollama process lifecycle. It watches for GPU intensive games and programs. When one is detected (or when non whitelisted VRAM usage exceeds a threshold), Ollama is shut down. When the GPU is free (after a configurable cooldown), Ollama is restarted and exposed to the local network for LLM inference.
+FreeCycle is a Windows 11 system tray application (written in Rust) that monitors NVIDIA GPU usage and manages the local inference (LLM) process lifecycle. It watches for GPU intensive games and programs. When one is detected (or when non whitelisted VRAM usage exceeds a threshold), local inference is shut down. When the GPU is free (after a configurable cooldown), local inference is restarted and exposed to the local network for LLM inference.
 
 FreeCycle exposes two network interfaces:
 
 1. **Agent Signal API** (default port 7443, configurable): A lightweight HTTP server for external agents to query GPU/system status and signal task start/stop events. This controls the tray icon state and coordinates GPU access.
 
-2. **Ollama API** (default port 11434, configurable): The standard Ollama REST API, managed by FreeCycle. Ollama is started and stopped automatically based on GPU availability. When running, it serves LLM inference and embedding requests over HTTP.
+2. **Inference API** (default port 7443, configurable): The FreeCycle Inference API, which proxies local inference requests. When running, it serves LLM inference and embedding requests over HTTPS.
 
 ### What is MCP?
 
@@ -20,7 +20,7 @@ The Model Context Protocol (MCP) is a standardized protocol that lets LLM applic
 
 ### What You Are Building
 
-An MCP server that wraps both the FreeCycle Agent Signal API and the Ollama API into a set of MCP tools. This lets any MCP compatible client (Claude, Codex, etc.) check GPU availability, manage tasks, run inference, generate embeddings, and manage models, all through a single MCP connection.
+An MCP server that wraps both the FreeCycle Agent Signal API and the FreeCycle Inference API into a set of MCP tools. This lets any MCP compatible client (Claude, Codex, etc.) check GPU availability, manage tasks, run inference, generate embeddings, and manage models, all through a single MCP connection.
 
 ---
 
@@ -52,14 +52,16 @@ This affects transport selection (stdio vs SSE), configuration file format, and 
 **Q3: FreeCycle Host and Ports**
 What are the FreeCycle host IP and port numbers?
 - Agent Signal API: default is `localhost:7443`
-- Ollama API: default is `localhost:11434`
+- FreeCycle Inference API (proxy): default is `localhost:7443` (secure mode) or `localhost:11434` (compatibility mode)
 - Is the MCP server running on the same machine as FreeCycle, or on a remote machine?
 - If remote, what is the FreeCycle machine's LAN IP?
-- If remote, should the MCP server support wake-on-LAN before local tools run?
-- If wake-on-LAN is required, what are the server MAC address, broadcast address, UDP port, packet count, poll interval, and maximum wait time before falling back to cloud?
+
+If remote and wake-on-LAN is required, also ask:
+- Should the MCP server support wake-on-LAN before local tools run?
+- What are the server MAC address, broadcast address, UDP port, packet count, poll interval, and maximum wait time before falling back to cloud?
 
 **Q4: Additional Tools**
-Beyond the standard tool set (listed in Section 4), do you need any of these?
+The standard 13-tool set is always included. This question is only about additions or customizations beyond that baseline. Do you need any of these?
 - Custom inference pipelines (multi step prompting, chain of thought with tool use)
 - RAG integration (document chunking, embedding storage, vector search)
 - Batch processing (queue multiple inference jobs, parallel embedding)
@@ -81,7 +83,7 @@ What authentication or security requirements exist?
 If anything is unclear after the five required questions, ask follow up questions. Common areas that need clarification:
 - Should the server support hot reloading of configuration?
 - What error reporting format does the client expect?
-- Are there rate limiting requirements for Ollama API calls?
+- Are there rate limiting requirements for FreeCycle Inference API calls?
 - Should the server implement request queuing when GPU is blocked?
 - What logging level and format is desired?
 - Should the server expose MCP resources (read only data) in addition to tools?
@@ -136,14 +138,14 @@ Returns the full system state as JSON.
 | Field | Type | Description |
 |-------|------|-------------|
 | status | string | Current display label from FreeCycle, for example `"Available"`, `"Blocked (Game Running)"`, `"Cooldown"`, `"Wake Delay"`, `"Agent Task Active"`, `"Downloading Models"`, `"Initializing"`, or `"Error"` |
-| ollama_running | boolean | Whether Ollama process is alive and healthy |
+| ollama_running | boolean | Whether the local inference service is alive and healthy |
 | vram_used_mb | number | Total VRAM in use across all processes (MB) |
 | vram_total_mb | number | Total GPU VRAM capacity (MB) |
 | vram_percent | number | VRAM usage percentage as an integer |
 | active_task_id | string or null | Task ID if an agent task is active |
 | active_task_description | string or null | Human readable task description if active |
 | local_ip | string | Machine's local LAN IP address |
-| ollama_port | number | Port Ollama is listening on |
+| ollama_port | number | Port the local inference service is listening on |
 | blocking_processes | string[] | Process names currently triggering a block |
 | model_status | string[] | Human readable model status messages from FreeCycle |
 | remote_model_installs_unlocked | boolean | `true` while the tray-controlled remote install window is open |
@@ -152,18 +154,18 @@ Returns the full system state as JSON.
 **Model status values:** FreeCycle currently exposes plain status strings rather than a keyed object. Preserve the array shape returned by the API.
 
 **GPU status values explained:**
-- `"Available"`: GPU is free, Ollama is running, ready for work.
-- `"Blocked (Game Running)"`: A blacklisted process is running. Ollama is stopped.
-- `"Cooldown"`: A post-game cooldown is active. Ollama stays stopped.
-- `"Wake Delay"`: The system recently resumed from sleep. Ollama stays stopped until the post-wake hold expires.
+- `"Available"`: GPU is free, local inference is running, ready for work.
+- `"Blocked (Game Running)"`: A blacklisted process is running. Local inference is stopped.
+- `"Cooldown"`: A post-game cooldown is active. Local inference stays stopped.
+- `"Wake Delay"`: The system recently resumed from sleep. Local inference stays stopped until the post-wake hold expires.
 - `"Agent Task Active"`: A tracked task is active and the tray is blue.
 - `"Downloading Models"`: Model work is active.
-- `"Error"`: GPU monitoring or Ollama lifecycle handling failed. Ollama state is uncertain.
+- `"Error"`: GPU monitoring or local inference lifecycle handling failed. Local inference state is uncertain.
 - `"Initializing"`: FreeCycle is still starting.
 
 #### POST /task/start
 
-Signal that an agent is beginning a task that uses Ollama. Turns the tray icon blue.
+Signal that an agent is beginning a task that uses local inference. Turns the tray icon blue.
 
 **Request Body:**
 ```json
@@ -244,7 +246,7 @@ Install a model through FreeCycle when the local user has enabled the tray menu 
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| model_name | string | yes | Full Ollama model name or tag to install |
+| model_name | string | yes | Full model name or tag to install (e.g., from freecycle_model_catalog) |
 
 **Response (200 OK):**
 ```json
@@ -273,17 +275,68 @@ Install a model through FreeCycle when the local user has enabled the tray menu 
 **Behavior Notes:**
 - The unlock is controlled only from the FreeCycle tray menu on the GPU machine.
 - The unlock automatically expires after one hour and cannot be extended remotely.
-- Use the official [Ollama Library](https://ollama.com/library) to discover installable model names.
+- Use the `freecycle_model_catalog` MCP tool to discover installable model names.
 
-### 3.2 Ollama REST API
+#### GET /models/catalog
 
-Base URL: `http://{FREECYCLE_HOST}:{OLLAMA_PORT}` (default: `http://localhost:11434`)
+Fetch the model catalog with metadata about available models and optional LLM-synthesized descriptions.
 
-These are standard Ollama endpoints. The MCP server wraps them into tools.
+**Response (200 OK):**
+```json
+{
+  "scraped_at": "2026-03-16T12:00:00Z",
+  "synthesized": true,
+  "models": [
+    {
+      "name": "llama3.2",
+      "description": "Meta's latest open-source model",
+      "parameter_sizes": ["1b", "3b", "7b"],
+      "quantization_variants": ["q4_0", "q8_0"],
+      "tags": ["chat", "function-calling"],
+      "download_count": 5000000,
+      "last_updated": "2026-02-28"
+    }
+  ]
+}
+```
 
-#### GET /
+**Response (404 Not Found):**
+```json
+{
+  "ok": false,
+  "message": "Model catalog not yet available"
+}
+```
 
-Health check. Returns `"Ollama is running"` when healthy.
+**Field Reference:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| scraped_at | string | ISO 8601 timestamp when the catalog was last scraped |
+| synthesized | boolean | Whether LLM-synthesis succeeded; if false, data is raw from scraping |
+| models | ModelCard[] | Array of available models |
+| models[].name | string | Model identifier (e.g., "llama3.2") |
+| models[].description | string | Human readable description |
+| models[].parameter_sizes | string[] | Available parameter sizes (e.g., ["7b", "13b"]) |
+| models[].quantization_variants | string[] | Available quantizations (e.g., ["q4_0", "q8_0"]) |
+| models[].tags | string[] | Classification tags (e.g., ["chat", "coding"]) |
+| models[].download_count | number or null | Download count from library, if available |
+| models[].last_updated | string or null | ISO 8601 timestamp of last update, if available |
+
+**Behavior Notes:**
+- The catalog is cached locally and updated every 24 hours or on startup if missing.
+- Synthesis happens automatically in the background and may fail gracefully; raw data is still available.
+- Use this endpoint to discover models before calling `POST /models/install`.
+
+### 3.2 Inference API (via FreeCycle Proxy)
+
+Base URL: `https://{FREECYCLE_HOST}:{AGENT_PORT}/api` (default: `https://localhost:7443/api`)
+
+These are inference endpoints proxied through FreeCycle. The MCP server wraps them into tools.
+
+#### GET /health
+
+Health check via FreeCycle proxy.
 
 #### GET /api/tags
 
@@ -436,7 +489,7 @@ Pull (download) a model.
 }
 ```
 
-**Important:** The shipped `freecycle_pull_model` MCP tool does not call `/api/pull` directly anymore. It calls FreeCycle `POST /models/install` so the tray-controlled one-hour unlock remains authoritative for remote installs.
+**Important:** The shipped `freecycle_pull_model` MCP tool calls FreeCycle `POST /models/install` so the tray-controlled one-hour unlock remains authoritative for remote installs.
 
 #### DELETE /api/delete
 
@@ -522,11 +575,11 @@ Get the complete FreeCycle status, including GPU state, VRAM usage, active task 
 }
 ```
 
-**Behavior:** Use the shared local-readiness helper first. If local inference is reachable, return the full `GET /status` payload. If local inference is unavailable, return the same structured cloud-fallback payload used by the shipped server, and include the latest FreeCycle status object when the FreeCycle host itself is reachable.
+**Behavior:** Use the shared local-readiness helper first. If the Inference API is reachable, return the full `GET /status` payload. If local inference is unavailable, return the same structured cloud-fallback payload used by the shipped server, and include the latest FreeCycle status object when the FreeCycle host itself is reachable.
 
 #### Tool: `freecycle_health`
 
-Check whether FreeCycle and Ollama are both reachable.
+Check whether FreeCycle and the Inference API are both reachable.
 
 **Input Schema:**
 ```json
@@ -537,7 +590,7 @@ Check whether FreeCycle and Ollama are both reachable.
 }
 ```
 
-**Behavior:** Run the same local-readiness helper. On success, return the JSON bodies from `GET /health` and the Ollama health check. On failure, return a structured local-unavailable result instead of throwing.
+**Behavior:** Run the same local-readiness helper. On success, return the JSON bodies from `GET /health` and the Inference API health check. On failure, return a structured local-unavailable result instead of throwing.
 
 #### Tool: `freecycle_start_task`
 
@@ -608,13 +661,13 @@ Return a simple readiness decision for local inference.
 ```
 If local inference is unavailable, return the same structured cloud-fallback payload used elsewhere.
 
-These two manual task tools are the escape hatch for custom workflows. The local execution tools below must still auto-signal FreeCycle around their own Ollama work so users do not have to call the manual task tools themselves.
+These two manual task tools are the escape hatch for custom workflows. The local execution tools below must still auto-signal FreeCycle around their own local inference work so users do not have to call the manual task tools themselves.
 
 ### 4.2 Model Management Tools
 
 #### Tool: `freecycle_list_models`
 
-List models currently available from the local Ollama instance.
+List models currently available from the FreeCycle Inference API.
 
 **Input Schema:**
 ```json
@@ -649,7 +702,7 @@ Inspect a specific local model.
 
 #### Tool: `freecycle_pull_model`
 
-Download a model to the local Ollama instance through FreeCycle's tray-gated install API.
+Download a model through FreeCycle's tray-gated install API.
 
 **Input Schema:**
 ```json
@@ -665,13 +718,13 @@ Download a model to the local Ollama instance through FreeCycle's tray-gated ins
 }
 ```
 
-**Behavior:** Run the shared local-readiness helper first. Then call FreeCycle `POST /models/install`, not Ollama `POST /api/pull`, so the tray-controlled one-hour unlock is enforced for remote installs. Wrap the full install with automatic `POST /task/start` and `POST /task/stop` using a short description such as `MCP pull: <model>`. Use a generous timeout. If task start returns `409`, return a structured local-unavailable result instead of starting the install. If FreeCycle returns `403`, surface the lock message so the user knows they must unlock remote installs from the tray again.
+**Behavior:** Run the shared local-readiness helper first. Then call FreeCycle `POST /models/install` so the tray-controlled one-hour unlock is enforced for remote installs. Wrap the full install with automatic `POST /task/start` and `POST /task/stop` using a short description such as `MCP pull: <model>`. Use a generous timeout. If task start returns `409`, return a structured local-unavailable result instead of starting the install. If FreeCycle returns `403`, surface the lock message so the user knows they must unlock remote installs from the tray again.
 
 ### 4.3 Inference and Embedding Tools
 
 #### Tool: `freecycle_generate`
 
-Generate text with a local Ollama model.
+Generate text via FreeCycle Inference API.
 
 **Input Schema:**
 ```json
@@ -703,7 +756,7 @@ Generate text with a local Ollama model.
 
 #### Tool: `freecycle_chat`
 
-Run a chat completion against a local Ollama model.
+Run a chat completion via FreeCycle Inference API.
 
 **Input Schema:**
 ```json
@@ -745,7 +798,7 @@ Run a chat completion against a local Ollama model.
 
 #### Tool: `freecycle_embed`
 
-Generate embeddings with the local Ollama embedding model.
+Generate embeddings via FreeCycle Inference API.
 
 **Input Schema:**
 ```json
@@ -839,7 +892,7 @@ freecycle-mcp-server/
     availability.ts       # Shared wake and readiness logic
     wake-on-lan.ts        # Magic-packet sender
     freecycle-client.ts   # HTTP client for the FreeCycle Agent API
-    ollama-client.ts      # HTTP client for the Ollama API
+    inference-client.ts   # HTTP client for the FreeCycle Inference API
     task-signaling.ts     # Automatic /task/start and /task/stop wrapper
     tools.ts              # Registers all 13 MCP tools
   package.json
@@ -855,7 +908,7 @@ freecycle-mcp-server/
 ```json
 {
   "dependencies": {
-    "@modelcontextprotocol/sdk": "latest",
+    "@modelcontextprotocol/sdk": "^1.27.0",
     "zod": "^3.22.0"
   },
   "devDependencies": {
@@ -866,7 +919,7 @@ freecycle-mcp-server/
 }
 ```
 
-Use the official MCP SDK (`@modelcontextprotocol/sdk`). Use `zod` for input validation (the MCP SDK uses zod schemas natively). Do not add unnecessary dependencies.
+Use the official MCP SDK (`@modelcontextprotocol/sdk`). Pinned to `^1.27.0` for stability. Check [npmjs.com/package/@modelcontextprotocol/sdk](https://www.npmjs.com/package/@modelcontextprotocol/sdk) for the latest stable version before generating, and update the version pin if a newer major release is available. Use `zod` for input validation (the MCP SDK uses zod schemas natively). Do not add unnecessary dependencies.
 
 ### 5.3 Server Initialization Pattern
 
@@ -893,8 +946,8 @@ The server must read configuration from a checked-in JSON file such as `freecycl
 |----------|---------|-------------|
 | `freecycle.host` | `localhost` | FreeCycle machine hostname or IP |
 | `freecycle.port` | `7443` | FreeCycle Agent Signal API port |
-| `ollama.host` | `localhost` | Ollama host. Usually the same machine as FreeCycle |
-| `ollama.port` | `11434` | Ollama API port |
+| `engine.host` | `localhost` | FreeCycle Inference API host. Usually the same machine as FreeCycle |
+| `engine.port` | `11434` | FreeCycle Inference API port (proxied through FreeCycle) |
 | `timeouts.requestMs` | `10000` | Default HTTP request timeout in milliseconds |
 | `timeouts.pullMs` | `600000` | Timeout for model pull operations |
 | `wakeOnLan.enabled` | `false` | Enables the wake-and-wait flow |
@@ -905,7 +958,9 @@ The server must read configuration from a checked-in JSON file such as `freecycl
 | `wakeOnLan.pollIntervalMs` | `30000` | Delay between FreeCycle readiness checks |
 | `wakeOnLan.maxWaitMs` | `900000` | Maximum wait before cloud fallback |
 
-Optional override variables can still be supported (`FREECYCLE_MCP_CONFIG`, `FREECYCLE_HOST`, `FREECYCLE_PORT`, `OLLAMA_HOST`, `OLLAMA_PORT`, and `FREECYCLE_WOL_*`), but the JSON config file is the main control surface.
+Optional override variables can still be supported (`FREECYCLE_MCP_CONFIG`, `FREECYCLE_HOST`, `FREECYCLE_PORT`, `ENGINE_HOST`, `ENGINE_PORT`, and `FREECYCLE_WOL_*`), but the JSON config file is the main control surface.
+
+**Auto-recreation:** If the config file does not exist at startup, the server must write the default config to disk before proceeding. This gives users a starting point to edit. If the write fails (e.g., read-only filesystem, missing directory), the server must throw an error reporting the config path and the underlying cause — do not silently fall back to in-memory defaults.
 
 ### 5.5 Tool Registration Example
 
@@ -920,7 +975,7 @@ import { z } from "zod";
 
 server.tool(
   "freecycle_status",
-  "Get the full FreeCycle system status including GPU state, VRAM usage, Ollama health, active tasks, and model readiness.",
+  "Get the full FreeCycle system status including GPU state, VRAM usage, Inference API health, active tasks, and model readiness.",
   {
     // Empty input schema: no parameters needed
   },
@@ -971,6 +1026,8 @@ server.tool(
   }
 );
 ```
+
+This example omits the local-readiness preflight. See Section 5.9 for the complete pattern that every local inference tool must use.
 
 ### 5.6 Tool Registration Example (With Input Parameters)
 
@@ -1123,7 +1180,7 @@ Use Node.js native `fetch` (available in Node 18+). Do not add `axios` or `node-
 
 Every tool must follow these error handling rules:
 
-1. **Network errors** (connection refused, timeout, DNS failure): Return `isError: true` with a message suggesting the user check that FreeCycle/Ollama is running and that host/port configuration is correct.
+1. **Network errors** (connection refused, timeout, DNS failure): Return `isError: true` with a message suggesting the user check that FreeCycle is running and that host/port configuration is correct.
 
 2. **HTTP 4xx errors**: Return the error response from the API with context. Do not set `isError: true` for expected error codes like 404 (task not found) or 409 (GPU blocked). These are informational.
 
@@ -1135,27 +1192,27 @@ Every tool must follow these error handling rules:
 
 ### 5.9 Pre flight GPU Check Pattern
 
-Before sending any inference, embedding, or model-management request to Ollama, the MCP server should follow this local-readiness flow:
+Before sending any inference, embedding, or model-management request via the Inference API, the MCP server should follow this local-readiness flow:
 
-1. Check whether Ollama is already responding.
-2. If Ollama is down, check whether FreeCycle is reachable.
+1. Check whether the Inference API is already responding.
+2. If the Inference API is down, check whether FreeCycle is reachable.
 3. If FreeCycle is unreachable and wake-on-LAN is enabled in the MCP config, silently send multiple magic packets to the configured FreeCycle host.
-4. Poll FreeCycle every 30 seconds by default, for up to 15 minutes by default, until the local server becomes usable or the configured maximum is hit.
-5. If wake-on-LAN is disabled, or the server never becomes ready, return a structured "route to cloud" result instead of hanging.
+4. Poll FreeCycle every 30 seconds by default, for up to 15 minutes by default, until local inference becomes usable or the configured maximum is hit.
+5. If wake-on-LAN is disabled, or local inference never becomes ready, return a structured "route to cloud" result instead of hanging.
 
 ```typescript
 async function ensureLocalAvailability(
   freecycleClient: FreeCycleClient,
-  ollamaClient: OllamaClient,
+  inferenceClient: InferenceClient,
   config: McpConfig
 ): Promise<
   | { available: true; wakeOnLanAttempted: boolean }
   | { available: false; reason: string; suggestedRoute: "cloud"; wakeOnLanAttempted: boolean }
 > {
   try {
-    await ollamaClient.healthCheck();
+    await inferenceClient.healthCheck();
     return { available: true, wakeOnLanAttempted: false };
-  } catch (ollamaError) {
+  } catch (inferenceError) {
     try {
       const { data } = await freecycleClient.get<StatusResponse>("/status");
 
@@ -1176,7 +1233,7 @@ async function ensureLocalAvailability(
       if (!config.wakeOnLan.enabled) {
         return {
           available: false,
-          reason: `Ollama is down and wake-on-LAN is disabled. Last Ollama error: ${String(ollamaError)}`,
+          reason: `Local inference is down and wake-on-LAN is disabled. Last error: ${String(inferenceError)}`,
           suggestedRoute: "cloud",
           wakeOnLanAttempted: false,
         };
@@ -1193,7 +1250,7 @@ async function ensureLocalAvailability(
           (data.status === "Available" || data.status === "Agent Task Active") &&
           data.ollama_running
         ) {
-          await ollamaClient.healthCheck();
+          await inferenceClient.healthCheck();
           return { available: true, wakeOnLanAttempted: true };
         }
 
@@ -1229,9 +1286,9 @@ async function ensureLocalAvailability(
 }
 ```
 
-Use this check inside every local-only MCP tool. If the local stack is not available, return the cloud fallback payload instead of attempting the Ollama request.
+Use this check inside every local-only MCP tool. If the local stack is not available, return the cloud fallback payload instead of attempting the Inference API request.
 
-After this readiness check passes, automatically wrap every local execution tool (`freecycle_generate`, `freecycle_chat`, `freecycle_embed`, `freecycle_pull_model`, and any benchmark or other long-running local job you add) with `POST /task/start` and `POST /task/stop`. Use one task signal pair per MCP invocation, not per nested Ollama call. This means a benchmark tool should signal once for the full benchmark run, not once per iteration.
+After this readiness check passes, automatically wrap every local execution tool (`freecycle_generate`, `freecycle_chat`, `freecycle_embed`, `freecycle_pull_model`, and any benchmark or other long-running local job you add) with `POST /task/start` and `POST /task/stop`. Use one task signal pair per MCP invocation, not per nested API call. This means a benchmark tool should signal once for the full benchmark run, not once per iteration.
 
 ### 5.10 Client Registration
 
@@ -1275,12 +1332,12 @@ Create a test script that validates the server works end to end:
 // test/test-server.ts
 // Run with: npx tsx test/test-server.ts
 
-import { FreeCycleClient } from "../src/lib/freecycle-client.js";
-import { OllamaClient } from "../src/lib/ollama-client.js";
+import { FreeCycleClient } from "../src/freecycle-client.js";
+import { InferenceClient } from "../src/inference-client.js";
 
 async function runTests() {
   const fc = new FreeCycleClient();
-  const ollama = new OllamaClient();
+  const inference = new InferenceClient();
 
   console.log("=== FreeCycle MCP Server Tests ===\n");
 
@@ -1305,10 +1362,10 @@ async function runTests() {
     console.log(`  FAIL: ${e}\n`);
   }
 
-  // Test 3: Ollama models
-  console.log("Test 3: List Ollama models");
+  // Test 3: List Inference API models
+  console.log("Test 3: List Inference API models");
   try {
-    const models = await ollama.get("/api/tags");
+    const models = await inference.get("/api/tags");
     console.log(`  Status: ${models.status}`);
     console.log(`  Models: ${JSON.stringify(models.data).slice(0, 200)}`);
     console.log("  PASS\n");
@@ -1334,14 +1391,14 @@ async function runTests() {
     console.log(`  FAIL: ${e}\n`);
   }
 
-  // Test 5: Ollama generate (only if GPU available)
-  console.log("Test 5: Ollama generate");
+  // Test 5: Inference API generate (only if GPU available)
+  console.log("Test 5: Inference API generate");
   try {
     const status = await fc.get<{ status: string }>("/status");
     if (status.data.status !== "Available") {
       console.log("  SKIP: GPU not available\n");
     } else {
-      const gen = await ollama.post("/api/generate", {
+      const gen = await inference.post("/api/generate", {
         model: "llama3.1:8b-instruct-q4_K_M",
         prompt: "Say hello in exactly 5 words.",
         stream: false,
@@ -1369,7 +1426,7 @@ These are absolute rules. Violating any of these makes the implementation incorr
 
 1. **No hardcoded IPs or ports.** All host addresses and port numbers must come from environment variables or configuration. Never use literal `"localhost"`, `"127.0.0.1"`, `7443`, or `11434` in tool implementation code. Only use them as default values in the config module.
 
-2. **No streaming responses without fallback.** Always set `"stream": false` when calling Ollama APIs. If you implement streaming support as an optional feature, always provide a non streaming fallback. MCP tool responses must return complete text, not incremental chunks.
+2. **No streaming responses without fallback.** Always set `"stream": false` when calling Inference API endpoints. If you implement streaming support as an optional feature, always provide a non streaming fallback. MCP tool responses must return complete text, not incremental chunks.
 
 3. **No inference requests without checking FreeCycle status first.** Before calling `freecycle_generate`, `freecycle_chat`, or `freecycle_embed`, check local readiness and confirm FreeCycle is effectively available, which in the current implementation means `status` is `"Available"` or `"Agent Task Active"` and `ollama_running === true`. If the GPU is blocked, return a descriptive message immediately instead of sending a request that will fail or hang.
 
@@ -1383,17 +1440,17 @@ These are absolute rules. Violating any of these makes the implementation incorr
 
 8. **No secrets in source code.** If the user configures API key authentication, the key must come from an environment variable, never from a source file or config file committed to version control.
 
-9. **No assumption about Ollama availability.** Ollama may be stopped, starting, or crashed at any time. FreeCycle controls its lifecycle. The MCP server must handle connection refused errors gracefully on every Ollama API call.
+9. **No assumption about Inference API availability.** Local inference may be stopped, starting, or crashed at any time. FreeCycle controls its lifecycle. The MCP server must handle connection refused errors gracefully on every Inference API call.
 
 10. **No ignoring HTTP status codes.** Check response status codes on every API call. A 200 from FreeCycle and a 409 from FreeCycle mean very different things. Parse and relay the appropriate information.
 
-11. **No bypassing the FreeCycle install gate.** The shipped `freecycle_pull_model` workflow must call FreeCycle `POST /models/install`, not Ollama `POST /api/pull`, so the tray-controlled one-hour unlock is always enforced for remote model installs.
+11. **No bypassing the FreeCycle install gate.** The shipped `freecycle_pull_model` workflow must call FreeCycle `POST /models/install` so the tray-controlled one-hour unlock is always enforced for remote model installs.
 
 12. **No excessive dependencies.** Use Node.js native `fetch` (Node 18+). Use the official MCP SDK and zod. Do not add axios, node-fetch, got, or similar HTTP libraries unless there is a specific technical need.
 
-13. **No tool names that conflict with built in MCP tools.** All tool names must be prefixed with `freecycle_` or `ollama_` to avoid collisions.
+13. **No tool names that conflict with built in MCP tools.** All tool names must be prefixed with `freecycle_` to avoid collisions.
 
-14. **No missing automatic task signaling for local execution tools.** After readiness succeeds, every MCP tool that sends real work to Ollama must wrap that work with `POST /task/start` and `POST /task/stop`. Reserve the manual task tools for custom workflows outside the built-in local execution tools.
+14. **No missing automatic task signaling for local execution tools.** After readiness succeeds, every MCP tool that sends real work via the Inference API must wrap that work with `POST /task/start` and `POST /task/stop`. Reserve the manual task tools for custom workflows outside the built-in local execution tools.
 
 ---
 
@@ -1409,7 +1466,7 @@ When implementation is complete, deliver all of the following files. Each file m
 
 3. **`src/freecycle-client.ts`**: HTTP client for the FreeCycle Agent API with timeout handling, typed responses, helpers for start/stop task responses, and a typed helper for `POST /models/install`.
 
-4. **`src/ollama-client.ts`**: HTTP client for the Ollama API with typed generate/chat/embed/model methods and configurable timeouts.
+4. **`src/inference-client.ts`**: HTTP client for the FreeCycle Inference API with typed generate/chat/embed/model methods and configurable timeouts.
 
 5. **`src/config.ts`**: Configuration loader reading `freecycle-mcp.config.json` with optional environment variable overrides.
 
@@ -1419,7 +1476,7 @@ When implementation is complete, deliver all of the following files. Each file m
 
 8. **`src/task-signaling.ts`**: Helper that wraps local operations with `POST /task/start` and `POST /task/stop`, including cleanup on success, error, timeout, or early return.
 
-9. **`freecycle-mcp.config.json`**: Default MCP runtime config including FreeCycle host, Ollama host, timeouts, and wake-on-LAN settings.
+9. **`freecycle-mcp.config.json`**: Default MCP runtime config including FreeCycle host, Inference API host, timeouts, and wake-on-LAN settings.
 
 10. **`package.json`**: Complete with name, version, scripts (build, start, test), dependencies, and `"type": "module"`.
 
@@ -1456,11 +1513,11 @@ Before considering the implementation complete, evaluate it against all 8 person
 
 **What this personality checks:**
 - Does the MCP server correctly represent itself as a FreeCycle integration (name, version, description)?
-- Does each tool's description accurately reflect what it does in the FreeCycle/Ollama ecosystem?
-- Is the relationship between FreeCycle (GPU manager) and Ollama (inference server) clear in tool descriptions?
+- Does each tool's description accurately reflect what it does in the FreeCycle ecosystem?
+- Is the relationship between FreeCycle (GPU manager) and the Inference API clear in tool descriptions?
 - Do tools correctly communicate GPU availability constraints to the calling agent?
 
-**Pass criteria:** An agent using these tools understands that GPU availability is managed by FreeCycle and that Ollama may not always be reachable.
+**Pass criteria:** An agent using these tools understands that GPU availability is managed by FreeCycle and that local inference may not always be reachable.
 
 ### Personality 3: Structure
 
@@ -1479,16 +1536,16 @@ Before considering the implementation complete, evaluate it against all 8 person
 - Does the README include working examples for every MCP client registration format?
 - Does the test script exercise every tool category (status, tasks, inference, models)?
 - Are there inline code comments showing expected request/response shapes?
-- Is there a curl equivalent shown for each FreeCycle/Ollama endpoint?
+- Is there a curl equivalent shown for each FreeCycle endpoint?
 
 **Pass criteria:** A user can copy the README examples directly and have a working setup.
 
 ### Personality 5: Negative Constraints
 
 **What this personality checks:**
-- Are all 12 negative constraints from Section 6 satisfied?
+- Are all 14 negative constraints from Section 6 satisfied?
 - Is there no hardcoded IP or port outside the config module?
-- Is `stream: false` always set on Ollama API calls?
+- Is `stream: false` always set on Inference API calls?
 - Is FreeCycle status always checked before inference?
 - Are all error paths handled with meaningful messages?
 - Are all tools fully implemented (no stubs)?
@@ -1521,11 +1578,11 @@ Before considering the implementation complete, evaluate it against all 8 person
 
 **What this personality checks:**
 - What happens if FreeCycle is unreachable? (Expected: tools return error, not crash.)
-- What happens if Ollama is unreachable? (Expected: inference tools return error with context.)
+- What happens if the local inference service is unreachable? (Expected: inference tools return error with context.)
 - What happens if FreeCycle returns unexpected JSON shape? (Expected: graceful degradation.)
 - What happens if a model pull takes 30 minutes? (Expected: extended timeout, not abort.)
 - What happens if task_start is called when GPU is blocked? (Expected: return 409 info, not crash.)
-- What happens if two clients call `freecycle_generate` simultaneously? (Expected: both succeed or one gets a clear error from Ollama.)
+- What happens if two clients call `freecycle_generate` simultaneously? (Expected: both succeed or one gets a clear error from the local inference service.)
 - What happens if VRAM is at 99%? (Expected: status correctly reports a blocked state such as `"Blocked (Game Running)"` or another non-available status.)
 - What happens if config env vars are missing? (Expected: use defaults, log a note.)
 
@@ -1535,7 +1592,7 @@ Before considering the implementation complete, evaluate it against all 8 person
 
 ## Quick Reference: FreeCycle Status Values
 
-| Status Value | Meaning | Ollama State | MCP Server Behavior |
+| Status Value | Meaning | Inference State | MCP Server Behavior |
 |-------------|---------|-------------|---------------------|
 | Available | GPU free, no blocks | Running | Allow inference requests |
 | Agent Task Active | Another task is currently tracked | Running | Treat local inference as available, but show active-task context |
@@ -1551,7 +1608,7 @@ Before considering the implementation complete, evaluate it against all 8 person
 | Service | Default Port | Config Key |
 |---------|-------------|-------------|
 | FreeCycle Agent API | 7443 | `freecycle.port` |
-| Ollama API | 11434 | `ollama.port` |
+| Inference API (via proxy) | 7443 | `engine.port` |
 | Wake-on-LAN UDP | 9 | `wakeOnLan.port` |
 
 ## Quick Reference: Wake-on-LAN Defaults

@@ -3,13 +3,13 @@
 /**
  * FreeCycle MCP Server
  *
- * Exposes FreeCycle (GPU lifecycle manager) and Ollama (local LLM inference)
+ * Exposes FreeCycle (GPU lifecycle manager) and its local LLM inference engine
  * as MCP tools for Claude Code, OpenAI Codex, or any MCP compatible client.
  *
  * Transport: stdio
  * Runtime config: ../freecycle-mcp.config.json by default
  * Optional env overrides: FREECYCLE_MCP_CONFIG, FREECYCLE_HOST, FREECYCLE_PORT,
- * OLLAMA_HOST, OLLAMA_PORT, and FREECYCLE_WOL_*
+ * ENGINE_HOST, ENGINE_PORT, and FREECYCLE_WOL_*
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";

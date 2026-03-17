@@ -3,10 +3,11 @@
  *
  * Provides methods for status queries, task lifecycle signaling, tray-gated model installs,
  * and health checks.
- * Uses native fetch (Node 18+). All methods accept an optional baseUrl override.
+ * Uses native fetch (Node 18+) via secureFetch for TLS support. All methods accept an optional baseUrl override.
  */
 
-import { getConfig } from "./config.js";
+import { getConfig, getActiveServer, type ServerEntry } from "./config.js";
+import { secureFetch } from "./secure-client.js";
 
 /** Shape returned by GET /status. */
 export interface FreeCycleStatus {
@@ -25,6 +26,24 @@ export interface FreeCycleStatus {
   remote_model_installs_expires_in_seconds: number | null;
 }
 
+/** A single model card in the catalog. */
+export interface ModelCard {
+  name: string;
+  description: string;
+  parameter_sizes: string[];
+  quantization_variants: string[];
+  tags: string[];
+  download_count: number | null;
+  last_updated: string | null;
+}
+
+/** Complete model catalog with metadata. */
+export interface ModelCatalog {
+  scraped_at: string;
+  synthesized: boolean;
+  models: ModelCard[];
+}
+
 /** Shape returned by POST /task/start and POST /task/stop. */
 export interface ApiResponse {
   ok: boolean;
@@ -37,9 +56,9 @@ export interface JsonHttpResponse<T> {
   body: T;
 }
 
-export function resolveBase(): string {
-  const config = getConfig();
-  return `http://${config.freecycle.host}:${config.freecycle.port}`;
+export function resolveBase(server?: ServerEntry): string {
+  const entry = server ?? getActiveServer();
+  return `https://${entry.host}:${entry.port}`;
 }
 
 function extractResponseMessage(parsed: unknown, fallback: string): string {
@@ -59,11 +78,12 @@ async function requestResponse<T>(
   url: string,
   init?: RequestInit,
   timeoutMs = getConfig().timeouts.requestSecs * 1000,
+  server?: ServerEntry,
 ): Promise<JsonHttpResponse<T>> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { ...init, signal: controller.signal });
+    const res = await secureFetch(url, server, { ...init, signal: controller.signal });
     const body = await res.text();
     let parsed: T;
     try {
@@ -92,8 +112,9 @@ async function request<T>(
   url: string,
   init?: RequestInit,
   timeoutMs = getConfig().timeouts.requestSecs * 1000,
+  server?: ServerEntry,
 ): Promise<T> {
-  const response = await requestResponse<T>(url, init, timeoutMs);
+  const response = await requestResponse<T>(url, init, timeoutMs, server);
   if (!response.ok) {
     const message = extractResponseMessage(
       response.body,
@@ -105,22 +126,25 @@ async function request<T>(
   return response.body;
 }
 
-/** Fetch the full FreeCycle status (GPU, VRAM, Ollama, active tasks, network). */
-export async function getStatus(baseUrl?: string): Promise<FreeCycleStatus> {
-  const base = baseUrl ?? resolveBase();
-  return request<FreeCycleStatus>(`${base}/status`);
+/** Fetch the full FreeCycle status (GPU, VRAM, engine, active tasks, network). */
+export async function getStatus(baseUrl?: string | ServerEntry): Promise<FreeCycleStatus> {
+  const server = typeof baseUrl === "object" ? baseUrl : undefined;
+  const base = typeof baseUrl === "string" ? baseUrl : resolveBase(server);
+  return request<FreeCycleStatus>(`${base}/status`, undefined, undefined, server);
 }
 
 /** Signal that an agentic workflow is beginning GPU work. */
 export async function startTask(
   taskId: string,
   description: string,
-  baseUrl?: string,
+  baseUrl?: string | ServerEntry,
 ): Promise<ApiResponse> {
   const response = await startTaskDetailed(taskId, description, baseUrl);
   if (!response.ok) {
+    const server = typeof baseUrl === "object" ? baseUrl : undefined;
+    const base = typeof baseUrl === "string" ? baseUrl : resolveBase(server);
     throw new Error(
-      `HTTP ${response.status} from ${(baseUrl ?? resolveBase())}/task/start: ${response.body.message}`,
+      `HTTP ${response.status} from ${base}/task/start: ${response.body.message}`,
     );
   }
 
@@ -131,25 +155,33 @@ export async function startTask(
 export async function startTaskDetailed(
   taskId: string,
   description: string,
-  baseUrl?: string,
+  baseUrl?: string | ServerEntry,
 ): Promise<JsonHttpResponse<ApiResponse>> {
-  const base = baseUrl ?? resolveBase();
-  return requestResponse<ApiResponse>(`${base}/task/start`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ task_id: taskId, description }),
-  });
+  const server = typeof baseUrl === "object" ? baseUrl : undefined;
+  const base = typeof baseUrl === "string" ? baseUrl : resolveBase(server);
+  return requestResponse<ApiResponse>(
+    `${base}/task/start`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: taskId, description }),
+    },
+    undefined,
+    server,
+  );
 }
 
 /** Signal that an agentic workflow has finished GPU work. */
 export async function stopTask(
   taskId: string,
-  baseUrl?: string,
+  baseUrl?: string | ServerEntry,
 ): Promise<ApiResponse> {
   const response = await stopTaskDetailed(taskId, baseUrl);
   if (!response.ok) {
+    const server = typeof baseUrl === "object" ? baseUrl : undefined;
+    const base = typeof baseUrl === "string" ? baseUrl : resolveBase(server);
     throw new Error(
-      `HTTP ${response.status} from ${(baseUrl ?? resolveBase())}/task/stop: ${response.body.message}`,
+      `HTTP ${response.status} from ${base}/task/stop: ${response.body.message}`,
     );
   }
 
@@ -159,31 +191,40 @@ export async function stopTask(
 /** Signal that an agentic workflow has finished GPU work and inspect the HTTP status. */
 export async function stopTaskDetailed(
   taskId: string,
-  baseUrl?: string,
+  baseUrl?: string | ServerEntry,
 ): Promise<JsonHttpResponse<ApiResponse>> {
-  const base = baseUrl ?? resolveBase();
-  return requestResponse<ApiResponse>(`${base}/task/stop`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ task_id: taskId }),
-  });
+  const server = typeof baseUrl === "object" ? baseUrl : undefined;
+  const base = typeof baseUrl === "string" ? baseUrl : resolveBase(server);
+  return requestResponse<ApiResponse>(
+    `${base}/task/stop`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: taskId }),
+    },
+    undefined,
+    server,
+  );
 }
 
 /** Quick connectivity check. Returns the ApiResponse from GET /health. */
-export async function healthCheck(baseUrl?: string): Promise<ApiResponse> {
-  const base = baseUrl ?? resolveBase();
-  return request<ApiResponse>(`${base}/health`);
+export async function healthCheck(baseUrl?: string | ServerEntry): Promise<ApiResponse> {
+  const server = typeof baseUrl === "object" ? baseUrl : undefined;
+  const base = typeof baseUrl === "string" ? baseUrl : resolveBase(server);
+  return request<ApiResponse>(`${base}/health`, undefined, undefined, server);
 }
 
 /** Request a model install through FreeCycle's tray-gated API. */
 export async function installModel(
   modelName: string,
-  baseUrl?: string,
+  baseUrl?: string | ServerEntry,
 ): Promise<ApiResponse> {
   const response = await installModelDetailed(modelName, baseUrl);
   if (!response.ok) {
+    const server = typeof baseUrl === "object" ? baseUrl : undefined;
+    const base = typeof baseUrl === "string" ? baseUrl : resolveBase(server);
     throw new Error(
-      `HTTP ${response.status} from ${(baseUrl ?? resolveBase())}/models/install: ${response.body.message}`,
+      `HTTP ${response.status} from ${base}/models/install: ${response.body.message}`,
     );
   }
 
@@ -193,9 +234,10 @@ export async function installModel(
 /** Request a model install and inspect the HTTP status. */
 export async function installModelDetailed(
   modelName: string,
-  baseUrl?: string,
+  baseUrl?: string | ServerEntry,
 ): Promise<JsonHttpResponse<ApiResponse>> {
-  const base = baseUrl ?? resolveBase();
+  const server = typeof baseUrl === "object" ? baseUrl : undefined;
+  const base = typeof baseUrl === "string" ? baseUrl : resolveBase(server);
   return requestResponse<ApiResponse>(
     `${base}/models/install`,
     {
@@ -204,5 +246,12 @@ export async function installModelDetailed(
       body: JSON.stringify({ model_name: modelName }),
     },
     getConfig().timeouts.pullSecs * 1000,
+    server,
   );
+}
+
+/** Fetch the model catalog (scraped models from ollama.com/library). */
+export async function getModelCatalog(server?: ServerEntry): Promise<ModelCatalog> {
+  const base = resolveBase(server);
+  return request<ModelCatalog>(`${base}/models/catalog`, undefined, undefined, server);
 }

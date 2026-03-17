@@ -17,7 +17,8 @@ Purpose: token-conscious entrypoint for MCP server questions. Read this file fir
 | Which config key or environment variable controls this behavior? | `references/config-and-timeouts.md` |
 | Which tool should I call and what does it do? | `references/tools-and-routing.md` |
 | Why did the server fail, route to cloud, reject a pull, or report model errors? | `references/failure-recovery.md` |
-| I need implementation detail for a specific behavior | `src/config.ts`, `src/availability.ts`, `src/freecycle-client.ts`, `src/ollama-client.ts`, `src/task-signaling.ts`, or `src/tools.ts` |
+| How do I add or manage multiple FreeCycle servers? | `specs/multi-server-mcp.md` |
+| I need implementation detail for a specific behavior | `src/config.ts`, `src/availability.ts`, `src/secure-client.ts`, `src/freecycle-client.ts`, `src/ollama-client.ts`, `src/task-signaling.ts`, or `src/tools.ts` |
 
 ## Document Index
 
@@ -38,16 +39,19 @@ Purpose: token-conscious entrypoint for MCP server questions. Read this file fir
 | Default config path | `mcp-server/freecycle-mcp.config.json` |
 | External config override | `FREECYCLE_MCP_CONFIG` |
 | Auto-tracked tools | `freecycle_pull_model`, `freecycle_generate`, `freecycle_chat`, `freecycle_embed`, `freecycle_benchmark` |
+| Multi-server management tool | `freecycle_add_server` |
 | Tray-gated remote install endpoint | FreeCycle `POST /models/install` |
 | Coarse routing helper | `freecycle_evaluate_task` |
+| TLS support via | `src/secure-client.ts` (TOFU fingerprint verification) |
 
 ## Source Map
 
 | Behavior | Primary File |
 |---|---|
-| Config loading and env overrides | `src/config.ts` |
+| Config loading, servers array, and env overrides | `src/config.ts` |
+| TLS with TOFU fingerprint verification | `src/secure-client.ts` |
 | Wake-and-wait readiness logic | `src/availability.ts` |
-| FreeCycle HTTP requests | `src/freecycle-client.ts` |
-| Ollama HTTP requests | `src/ollama-client.ts` |
+| FreeCycle HTTP requests (TLS-capable) | `src/freecycle-client.ts` |
+| Ollama HTTP requests with proxy routing | `src/ollama-client.ts` |
 | Automatic task start and stop wrapping | `src/task-signaling.ts` |
 | Tool registration and return payloads | `src/tools.ts` |

@@ -10,8 +10,8 @@ These local-only tools all use the same readiness helper before they touch Ollam
 
 The readiness helper:
 
-1. Checks Ollama health.
-2. Falls back to FreeCycle status checks if Ollama is down.
+1. Checks FreeCycle Inference API health.
+2. Falls back to FreeCycle status checks if local inference is down.
 3. Sends wake-on-LAN packets when configured and needed.
 4. Returns a structured cloud-fallback payload when local inference is still unavailable.
 
@@ -19,11 +19,11 @@ The readiness helper:
 
 | Group | Tools | Notes |
 |---|---|---|
-| Status and health | `freecycle_status`, `freecycle_health`, `freecycle_check_availability` | Use these before inference when the local stack might be asleep or blocked |
+| Status and health | `freecycle_status`, `freecycle_health`, `freecycle_check_availability` | Use these before inference when local inference might be asleep or blocked |
 | Manual task signaling | `freecycle_start_task`, `freecycle_stop_task` | For custom workflows outside built-in tracked tools |
 | Model inventory | `freecycle_list_models`, `freecycle_show_model` | Use before generation if model fit is uncertain |
-| Model install | `freecycle_pull_model` | Calls FreeCycle `/models/install`, not Ollama `/api/pull` |
-| Inference | `freecycle_generate`, `freecycle_chat`, `freecycle_embed` | Local execution via Ollama |
+| Model install | `freecycle_pull_model` | Calls FreeCycle `/models/install` endpoint |
+| Inference | `freecycle_generate`, `freecycle_chat`, `freecycle_embed` | Local execution via FreeCycle Inference API |
 | Routing and evaluation | `freecycle_evaluate_task` | Coarse recommendation only |
 | Benchmarking | `freecycle_benchmark` | Benchmarks a local model over repeated generate calls |
 
@@ -36,6 +36,16 @@ These tools automatically signal `POST /task/start` and `POST /task/stop` so the
 - `freecycle_chat`
 - `freecycle_embed`
 - `freecycle_benchmark`
+
+**Task Description Constraints:**
+
+Automatically-generated task descriptions must be exactly 30–40 characters. The `task-signaling.ts` module:
+
+1. Builds a base description from operation label and model name
+2. Truncates to 40 chars if over
+3. Pads with meaningful text (e.g., " (local)", " via API") to reach 30 chars if under
+4. Validates against the server-side padding rules before sending
+5. Falls back to `"MCP task via FreeCycle local API"` (32 chars) if construction fails
 
 ## Important Behavior
 

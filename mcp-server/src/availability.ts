@@ -1,13 +1,14 @@
-import { getConfig } from "./config.js";
+import { getConfig, getActiveServer, type ServerEntry } from "./config.js";
 import type { FreeCycleStatus } from "./freecycle-client.js";
 import * as freecycle from "./freecycle-client.js";
-import * as ollama from "./ollama-client.js";
+import * as engine from "./engine-client.js";
+import * as router from "./router.js";
 import { sendWakeOnLanPackets } from "./wake-on-lan.js";
 
 export interface LocalAvailability {
   available: boolean;
   freecycleReachable: boolean;
-  ollamaReachable: boolean;
+  engineReachable: boolean;
   wakeOnLanEnabled: boolean;
   wakeOnLanAttempted: boolean;
   freecycleStatus: string | null;
@@ -41,7 +42,7 @@ function availabilityResult(
   return {
     available: overrides.available,
     freecycleReachable: overrides.freecycleReachable ?? false,
-    ollamaReachable: overrides.ollamaReachable ?? false,
+    engineReachable: overrides.engineReachable ?? false,
     wakeOnLanEnabled: overrides.wakeOnLanEnabled ?? config.wakeOnLan.enabled,
     wakeOnLanAttempted: overrides.wakeOnLanAttempted ?? false,
     freecycleStatus: overrides.freecycleStatus ?? null,
@@ -61,12 +62,15 @@ function isStatusReady(status: FreeCycleStatus): boolean {
   );
 }
 
-async function tryGetFreecycleStatus(): Promise<
+async function tryGetFreecycleStatus(
+  server?: ServerEntry,
+): Promise<
   | { ok: true; status: FreeCycleStatus }
   | { ok: false; message: string }
 > {
   try {
-    const status = await freecycle.getStatus();
+    const resolvedServer = server ?? getActiveServer();
+    const status = await freecycle.getStatus(resolvedServer);
     return { ok: true, status };
   } catch (error: unknown) {
     return { ok: false, message: formatError(error) };
@@ -76,14 +80,15 @@ async function tryGetFreecycleStatus(): Promise<
 async function waitForAvailability(
   wakeOnLanAttempted: boolean,
   initialReason: string,
+  server?: ServerEntry,
 ): Promise<LocalAvailability> {
   const config = getConfig();
   const deadline = Date.now() + config.wakeOnLan.maxWaitSecs * 1000;
   let lastFreecycleMessage = initialReason;
-  let lastOllamaMessage = initialReason;
+  let lastEngineMessage = initialReason;
 
   while (Date.now() <= deadline) {
-    const statusResult = await tryGetFreecycleStatus();
+    const statusResult = await tryGetFreecycleStatus(server);
     if (statusResult.ok) {
       const status = statusResult.status;
 
@@ -102,22 +107,21 @@ async function waitForAvailability(
       }
 
       if (isStatusReady(status)) {
-        try {
-          await ollama.healthCheck();
-          return availabilityResult({
-            available: true,
-            freecycleReachable: true,
-            ollamaReachable: true,
-            wakeOnLanAttempted,
-            freecycleStatus: status.status,
-            blockingProcesses: status.blocking_processes,
-            reason: "Ollama is responding.",
-          });
-        } catch (error: unknown) {
-          lastOllamaMessage = formatError(error);
-        }
+        // FreeCycle is the authoritative source for engine status. When it reports
+        // Available + ollama_running, trust it directly — no separate engine probe.
+        // An extra GET /api/version check is redundant and can fail spuriously
+        // (e.g. if the model is still loading) even though requests would succeed.
+        return availabilityResult({
+          available: true,
+          freecycleReachable: true,
+          engineReachable: true,
+          wakeOnLanAttempted,
+          freecycleStatus: status.status,
+          blockingProcesses: status.blocking_processes,
+          reason: "Engine is responding.",
+        });
       } else {
-        lastOllamaMessage = `FreeCycle reports ${status.status} and ollama_running=${status.ollama_running}.`;
+        lastEngineMessage = `FreeCycle reports ${status.status} and engine_running=${status.ollama_running}.`;
       }
 
       lastFreecycleMessage = `FreeCycle reports ${status.status}.`;
@@ -136,24 +140,28 @@ async function waitForAvailability(
     available: false,
     wakeOnLanAttempted,
     reason:
-      `Local Ollama did not become available within ${config.wakeOnLan.maxWaitSecs} seconds. ` +
-      `Last FreeCycle check: ${lastFreecycleMessage}. Last Ollama check: ${lastOllamaMessage}.`,
+      `Local engine did not become available within ${config.wakeOnLan.maxWaitSecs} seconds. ` +
+      `Last FreeCycle check: ${lastFreecycleMessage}. Last engine check: ${lastEngineMessage}.`,
   });
 }
 
 async function performAvailabilityCheck(): Promise<LocalAvailability> {
   const config = getConfig();
 
+  // Try to select the best available server
+  const best = await router.selectBestServer();
+  const selectedServer = best?.server;
+
   try {
-    await ollama.healthCheck();
+    await engine.healthCheck(undefined, selectedServer);
     return availabilityResult({
       available: true,
-      ollamaReachable: true,
-      reason: "Ollama is responding.",
+      engineReachable: true,
+      reason: "Engine is responding.",
     });
-  } catch (ollamaError: unknown) {
-    const ollamaMessage = formatError(ollamaError);
-    const statusResult = await tryGetFreecycleStatus();
+  } catch (engineError: unknown) {
+    const engineMessage = formatError(engineError);
+    const statusResult = await tryGetFreecycleStatus(selectedServer);
 
     if (statusResult.ok) {
       const status = statusResult.status;
@@ -170,15 +178,28 @@ async function performAvailabilityCheck(): Promise<LocalAvailability> {
         });
       }
 
-      return waitForAvailability(false, ollamaMessage);
+      // FreeCycle is reachable and reports the engine is ready: trust it directly.
+      // Skip the 900s polling loop — FreeCycle is the authoritative source.
+      if (isStatusReady(status)) {
+        return availabilityResult({
+          available: true,
+          freecycleReachable: true,
+          engineReachable: true,
+          freecycleStatus: status.status,
+          blockingProcesses: status.blocking_processes,
+          reason: "Engine is responding.",
+        });
+      }
+
+      return waitForAvailability(false, engineMessage, selectedServer);
     }
 
     if (!config.wakeOnLan.enabled) {
       return availabilityResult({
         available: false,
         reason:
-          `Local Ollama is not responding, FreeCycle is unreachable, and wake-on-LAN is disabled. ` +
-          `Last Ollama error: ${ollamaMessage}.`,
+          `Local inference engine is not responding, FreeCycle is unreachable, and wake-on-LAN is disabled. ` +
+          `Last engine error: ${engineMessage}.`,
       });
     }
 
@@ -191,7 +212,7 @@ async function performAvailabilityCheck(): Promise<LocalAvailability> {
     }
 
     await sendWakeOnLanPackets(config.wakeOnLan);
-    return waitForAvailability(true, ollamaMessage);
+    return waitForAvailability(true, engineMessage, selectedServer);
   }
 }
 
@@ -217,7 +238,7 @@ export function createCloudFallbackPayload(
     wake_on_lan_enabled: availability.wakeOnLanEnabled,
     wake_on_lan_attempted: availability.wakeOnLanAttempted,
     freecycle_reachable: availability.freecycleReachable,
-    ollama_reachable: availability.ollamaReachable,
+    engine_reachable: availability.engineReachable,
     freecycle_status: availability.freecycleStatus,
     blocking_processes: availability.blockingProcesses,
     message: availability.reason,

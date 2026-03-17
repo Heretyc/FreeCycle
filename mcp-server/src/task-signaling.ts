@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
+import { type ServerEntry } from "./config.js";
 import {
   createCloudFallbackPayload,
   type LocalAvailability,
 } from "./availability.js";
 import * as freecycle from "./freecycle-client.js";
 
-const MAX_TASK_DESCRIPTION_LENGTH = 64;
+const MIN_TASK_DESCRIPTION_LENGTH = 30;
+const MAX_TASK_DESCRIPTION_LENGTH = 40;
 const TASK_ID_SUFFIX_LENGTH = 8;
 
 export interface TrackedLocalOperationOptions {
@@ -14,6 +16,7 @@ export interface TrackedLocalOperationOptions {
   modelName: string;
   availability: LocalAvailability;
   detail?: string;
+  server?: ServerEntry;
 }
 
 export type TrackedLocalOperationResult<T> =
@@ -43,26 +46,95 @@ function sanitizeAction(action: string): string {
   return sanitized === "" ? "task" : sanitized;
 }
 
-function truncateDescription(description: string): string {
-  if (description.length <= MAX_TASK_DESCRIPTION_LENGTH) {
-    return description;
-  }
-
-  return `${description.slice(0, MAX_TASK_DESCRIPTION_LENGTH - 3)}...`;
-}
-
 function buildTaskId(action: string): string {
   const suffix = randomUUID().replace(/-/g, "").slice(0, TASK_ID_SUFFIX_LENGTH);
   return `mcp-${sanitizeAction(action)}-${Date.now()}-${suffix}`;
 }
 
+/// Validates a task description according to Priority 10 constraints.
+/// Returns null if valid, or an error string if invalid.
+function validateTaskDescription(description: string): string | null {
+  // Check 1: Length must be 30-40 characters
+  if (description.length < MIN_TASK_DESCRIPTION_LENGTH || description.length > MAX_TASK_DESCRIPTION_LENGTH) {
+    return "Task description must be 30-40 characters";
+  }
+
+  // Check 2: No char dominance (>60% of description)
+  const charFreq = new Map<string, number>();
+  for (const ch of description.toLowerCase()) {
+    charFreq.set(ch, (charFreq.get(ch) || 0) + 1);
+  }
+  const maxCharFreq = Math.max(...Array.from(charFreq.values()));
+  if (maxCharFreq / description.length > 0.60) {
+    return "Task description appears to contain padding";
+  }
+
+  // Check 3: Must contain at least one alphanumeric character
+  if (!/[a-z0-9]/i.test(description)) {
+    return "Task description appears to contain padding";
+  }
+
+  // Check 4: Repeated words dominance (>60% of qualifying words)
+  const words = description
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(w => w.length >= 2);
+
+  if (words.length >= 3) {
+    const wordFreq = new Map<string, number>();
+    for (const word of words) {
+      wordFreq.set(word, (wordFreq.get(word) || 0) + 1);
+    }
+    const maxWordFreq = Math.max(...Array.from(wordFreq.values()));
+    if (maxWordFreq / words.length > 0.60) {
+      return "Task description appears to contain padding";
+    }
+  }
+
+  return null;
+}
+
 function buildTaskDescription(options: TrackedLocalOperationOptions): string {
   const detail = options.detail?.trim();
-  const description = detail
+  const base = detail
     ? `MCP ${options.operationLabel}: ${options.modelName} ${detail}`
     : `MCP ${options.operationLabel}: ${options.modelName}`;
 
-  return truncateDescription(description);
+  // Trim to at most 40 chars
+  let description = base.length > MAX_TASK_DESCRIPTION_LENGTH
+    ? base.slice(0, MAX_TASK_DESCRIPTION_LENGTH)
+    : base;
+
+  // Pad to at least 30 chars with meaningful text
+  if (description.length < MIN_TASK_DESCRIPTION_LENGTH) {
+    // Try padding with (local) first
+    if (!description.includes("(local)")) {
+      const candidate = `${description} (local)`;
+      if (candidate.length <= MAX_TASK_DESCRIPTION_LENGTH) {
+        description = candidate;
+      }
+    }
+    // Still short? Try via API
+    if (description.length < MIN_TASK_DESCRIPTION_LENGTH && !description.includes("via API")) {
+      const candidate = `${description} via API`;
+      if (candidate.length <= MAX_TASK_DESCRIPTION_LENGTH) {
+        description = candidate;
+      }
+    }
+    // Still short? Pad with spaces to reach minimum
+    if (description.length < MIN_TASK_DESCRIPTION_LENGTH) {
+      description = description.padEnd(MIN_TASK_DESCRIPTION_LENGTH, " ");
+    }
+  }
+
+  // Final validation and safe fallback
+  const validation = validateTaskDescription(description);
+  if (validation !== null) {
+    warn(`Task description validation failed: ${validation}. Using fallback.`);
+    return "MCP task via FreeCycle local API";
+  }
+
+  return description;
 }
 
 async function buildConflictPayload(
@@ -73,12 +145,12 @@ async function buildConflictPayload(
     ...options.availability,
     available: false,
     freecycleReachable: true,
-    ollamaReachable: false,
+    engineReachable: false,
     reason: message,
   };
 
   try {
-    const status = await freecycle.getStatus();
+    const status = await freecycle.getStatus(options.server);
     conflictAvailability = {
       ...conflictAvailability,
       freecycleStatus: status.status,
@@ -108,9 +180,16 @@ async function beginTrackedTask(
   description: string,
 ): Promise<StartDecision> {
   try {
-    const response = await freecycle.startTaskDetailed(taskId, description);
+    const response = await freecycle.startTaskDetailed(taskId, description, options.server);
     if (response.ok && response.body.ok) {
       return { kind: "continue", started: true };
+    }
+
+    if (response.status === 400) {
+      warn(
+        `Task description rejected by server for ${options.action} (${taskId}): ${response.body.message}. Continuing without tray tracking.`,
+      );
+      return { kind: "continue", started: false };
     }
 
     if (response.status === 409) {
@@ -141,9 +220,13 @@ async function beginTrackedTask(
   }
 }
 
-async function stopTrackedTask(action: string, taskId: string): Promise<void> {
+async function stopTrackedTask(
+  action: string,
+  taskId: string,
+  server?: ServerEntry,
+): Promise<void> {
   try {
-    const response = await freecycle.stopTaskDetailed(taskId);
+    const response = await freecycle.stopTaskDetailed(taskId, server);
     if (response.ok && response.body.ok) {
       return;
     }
@@ -184,7 +267,7 @@ export async function runTrackedLocalOperation<T>(
     return { kind: "completed", value };
   } finally {
     if (startDecision.started) {
-      await stopTrackedTask(options.action, taskId);
+      await stopTrackedTask(options.action, taskId, options.server);
     }
   }
 }

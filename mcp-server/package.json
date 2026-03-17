@@ -1,6 +1,6 @@
 {
   "name": "@freecycle/mcp-server",
-  "version": "0.1.0",
+  "version": "1.0.51",
   "description": "MCP server for FreeCycle GPU-aware Ollama lifecycle manager",
   "type": "module",
   "main": "dist/index.js",
@@ -10,7 +10,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "test": "tsx test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.0",

@@ -1,8 +1,9 @@
 //! Windows auto-start management for FreeCycle.
 //!
-//! Handles two responsibilities:
+//! Handles three responsibilities:
 //! 1. Registering FreeCycle to auto-start with Windows (registry Run key).
 //! 2. Disabling Ollama's own auto-start (registry Run key and scheduled tasks).
+//! 3. Enforcing Ollama's network binding to localhost via HKCU\Environment.
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
@@ -11,6 +12,9 @@ use winreg::RegKey;
 
 /// Registry path for user auto-start programs.
 const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+/// Registry path for user-level persistent environment variables.
+const USER_ENV_KEY_PATH: &str = "Environment";
 
 /// The registry value name FreeCycle uses for its auto-start entry.
 const FREECYCLE_REG_NAME: &str = "FreeCycle";
@@ -141,6 +145,73 @@ fn disable_ollama_registry_run(hkey: winreg::HKEY, label: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Enforces Ollama to bind only to the configured secure loopback address by
+/// writing `OLLAMA_HOST` to the Windows user environment registry
+/// (`HKCU\Environment`) and broadcasting `WM_SETTINGCHANGE` so all running
+/// processes (including Ollama's own tray) pick up the change immediately.
+///
+/// This stops the kill/restart loop caused by Ollama's tray or autostart
+/// relaunching Ollama bound to `0.0.0.0` after FreeCycle kills it.
+///
+/// # Arguments
+///
+/// * `host` - The loopback address to lock Ollama to (e.g. `"127.0.0.1"` or `"127.0.0.2"`).
+/// * `port` - The Ollama port (builds `"<host>:<port>"`).
+///
+/// # Errors
+///
+/// Returns an error if the registry key cannot be opened or written.
+pub fn enforce_ollama_localhost_binding(host: &str, port: u16) -> Result<()> {
+    let host_value = format!("{}:{}", host, port);
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let env_key = hkcu
+        .open_subkey_with_flags(USER_ENV_KEY_PATH, KEY_SET_VALUE)
+        .context("Failed to open HKCU\\Environment registry key")?;
+
+    env_key
+        .set_value("OLLAMA_HOST", &host_value)
+        .context("Failed to set OLLAMA_HOST in user environment registry")?;
+
+    info!("Set HKCU\\Environment\\OLLAMA_HOST = {}", host_value);
+
+    broadcast_environment_change();
+
+    Ok(())
+}
+
+/// Broadcasts `WM_SETTINGCHANGE` to all top-level windows so they refresh
+/// their user environment block and pick up the new `OLLAMA_HOST` value.
+///
+/// This is a best-effort notification; failure is non-fatal.
+fn broadcast_environment_change() {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+    };
+
+    let env_wide: Vec<u16> = OsStr::new("Environment")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut result: usize = 0;
+    unsafe {
+        SendMessageTimeoutW(
+            0xFFFF as *mut std::ffi::c_void, // HWND_BROADCAST
+            WM_SETTINGCHANGE,
+            0,
+            env_wide.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            5000,
+            &mut result,
+        );
+    }
+
+    debug!("Broadcast WM_SETTINGCHANGE to propagate OLLAMA_HOST environment change");
 }
 
 /// Attempts to disable Ollama scheduled tasks using `schtasks`.

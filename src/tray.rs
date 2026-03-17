@@ -311,15 +311,18 @@ fn build_tooltip(state: &AppState) -> String {
     let mut lines: Vec<String> = Vec::new();
     let now = Instant::now();
 
-    // Status line
-    let status_line = match state.manual_override {
-        Some(ManualOverride::ForceEnable) => {
+    // Status line (show task description when AgentTaskActive)
+    let status_line = match (&state.status, &state.agent_task, state.manual_override) {
+        (FreeCycleStatus::AgentTaskActive, Some(task), None) => {
+            format!("FreeCycle: {}", task.description)
+        }
+        (_, _, Some(ManualOverride::ForceEnable)) => {
             format!("FreeCycle: Forced Available ({})", state.status.label())
         }
-        Some(ManualOverride::ForceDisable) => {
+        (_, _, Some(ManualOverride::ForceDisable)) => {
             format!("FreeCycle: Forced Stop ({})", state.status.label())
         }
-        None => format!("FreeCycle: {}", state.status.label()),
+        _ => format!("FreeCycle: {}", state.status.label()),
     };
     lines.push(status_line);
 
@@ -371,12 +374,9 @@ fn build_tooltip(state: &AppState) -> String {
         ));
     }
 
-    // Agent task info
+    // Agent task info (show only source IP, description already in status line)
     if let Some(ref task) = state.agent_task {
-        lines.push(format!(
-            "Task: {} (from {})",
-            task.description, task.source_ip
-        ));
+        lines.push(format!("From: {}", task.source_ip));
     }
 
     if let Some(override_mode) = state.manual_override {
@@ -430,6 +430,8 @@ fn build_tooltip(state: &AppState) -> String {
 /// * `state` - Shared application state.
 /// * `shutdown_tx` - Watch channel sender to signal shutdown to all subsystems.
 /// * `runtime` - Reference to the Tokio runtime for blocking on async state reads.
+/// * `lock` - Process lock to prevent multiple instances.
+/// * `cert_regenerated` - Whether TLS certificates were regenerated on startup.
 ///
 /// # Errors
 ///
@@ -439,6 +441,7 @@ pub fn run_tray(
     shutdown_tx: watch::Sender<bool>,
     runtime: &Runtime,
     lock: &ProcessLock,
+    cert_regenerated: bool,
 ) -> Result<()> {
     let class_name = to_wide_null("FreeCyclePowerEvents");
     let window_name = to_wide_null("FreeCycle Power Event Window");
@@ -495,6 +498,16 @@ pub fn run_tray(
     }
 
     info!("Registered hidden tray window for suspend or resume notifications");
+
+    // Show notification if TLS certificates were regenerated
+    if cert_regenerated {
+        notifications::show_balloon(
+            power_window,
+            "FreeCycle: TLS certificates regenerated",
+            "",
+            BalloonKind::Info,
+        );
+    }
 
     // Build context menu
     let menu = Menu::new();

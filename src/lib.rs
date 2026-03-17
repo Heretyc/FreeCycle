@@ -9,11 +9,14 @@ compile_error!("FreeCycle only supports Windows");
 pub mod agent_server;
 pub mod autostart;
 pub mod config;
+pub mod exposure_monitor;
 pub mod gpu_monitor;
 pub mod lockfile;
 pub mod logging;
+pub mod model_catalog;
 pub mod notifications;
 pub mod ollama;
+pub mod security;
 pub mod state;
 pub mod tray;
 
@@ -130,6 +133,10 @@ pub struct AppState {
 
     /// Whether model downloads are currently in progress.
     pub models_downloading: bool,
+
+    /// HWND for tray notification window (used by exposure monitor).
+    /// Set by tray module when initialized.
+    pub notification_hwnd: Option<isize>,
 }
 
 impl AppState {
@@ -156,6 +163,7 @@ impl AppState {
             model_progress: Vec::new(),
             model_status: Vec::new(),
             models_downloading: false,
+            notification_hwnd: None,
         }
     }
 

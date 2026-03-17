@@ -3,6 +3,14 @@
     "host": "localhost",
     "port": 7443
   },
+  "servers": [
+    {
+      "host": "localhost",
+      "port": 7443,
+      "name": "Local",
+      "approved": true
+    }
+  ],
   "ollama": {
     "host": "localhost",
     "port": 11434

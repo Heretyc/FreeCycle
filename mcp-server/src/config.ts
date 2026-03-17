@@ -1,4 +1,5 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export interface EndpointConfig {
@@ -23,26 +24,42 @@ export interface WakeOnLanConfig {
   maxWaitSecs: number;
 }
 
+export interface ServerEntry {
+  host: string;
+  port: number;
+  name?: string;
+  approved: boolean;
+  tls_fingerprint?: string;
+  identity_uuid?: string;
+  wakeOnLan?: Partial<WakeOnLanConfig>;
+  timeouts?: Partial<TimeoutConfig>;
+}
+
 export interface McpServerConfig {
-  freecycle: EndpointConfig;
-  ollama: EndpointConfig;
+  freecycle?: EndpointConfig;
+  servers?: ServerEntry[];
+  engine: EndpointConfig;
   timeouts: TimeoutConfig;
   wakeOnLan: WakeOnLanConfig;
 }
 
 type PartialConfig = Partial<{
   freecycle: Partial<EndpointConfig>;
-  ollama: Partial<EndpointConfig>;
+  servers: ServerEntry[];
+  engine: Partial<EndpointConfig>;
   timeouts: Partial<TimeoutConfig>;
   wakeOnLan: Partial<WakeOnLanConfig>;
 }>;
 
+const DEFAULT_SERVER: ServerEntry = {
+  host: "localhost",
+  port: 7443,
+  approved: true,
+};
+
 const DEFAULT_CONFIG: McpServerConfig = {
-  freecycle: {
-    host: "localhost",
-    port: 7443,
-  },
-  ollama: {
+  servers: [DEFAULT_SERVER],
+  engine: {
     host: "localhost",
     port: 11434,
   },
@@ -96,33 +113,52 @@ function readConfigFile(configPath: string): PartialConfig {
   return parsed;
 }
 
-function mergeConfig(fileConfig: PartialConfig): McpServerConfig {
-  const freecycleHost =
-    process.env.FREECYCLE_HOST ??
-    fileConfig.freecycle?.host ??
-    DEFAULT_CONFIG.freecycle.host;
-  const freecyclePort = parseNumber(
-    process.env.FREECYCLE_PORT,
-    fileConfig.freecycle?.port ?? DEFAULT_CONFIG.freecycle.port,
-  );
+function normalizeServersArray(
+  fileConfig: PartialConfig,
+): ServerEntry[] {
+  // If servers array exists, use it
+  if (fileConfig.servers != null && fileConfig.servers.length > 0) {
+    return fileConfig.servers;
+  }
 
-  const ollamaHost =
-    process.env.OLLAMA_HOST ??
-    fileConfig.ollama?.host ??
-    freecycleHost;
-  const ollamaPort = parseNumber(
-    process.env.OLLAMA_PORT,
-    fileConfig.ollama?.port ?? DEFAULT_CONFIG.ollama.port,
+  // Backward compat: if old freecycle key exists, treat as single-server config
+  if (fileConfig.freecycle != null) {
+    const freecycleHost =
+      process.env.FREECYCLE_HOST ?? fileConfig.freecycle.host ?? DEFAULT_SERVER.host;
+    const freecyclePort = parseNumber(
+      process.env.FREECYCLE_PORT,
+      fileConfig.freecycle.port ?? DEFAULT_SERVER.port,
+    );
+    return [
+      {
+        host: freecycleHost,
+        port: freecyclePort,
+        approved: true,
+      },
+    ];
+  }
+
+  // Fallback to default
+  return [DEFAULT_SERVER];
+}
+
+function mergeConfig(fileConfig: PartialConfig): McpServerConfig {
+  const servers = normalizeServersArray(fileConfig);
+
+  const engineHost =
+    process.env.ENGINE_HOST ??
+    fileConfig.engine?.host ??
+    (servers[0]?.host ?? DEFAULT_SERVER.host);
+  const enginePort = parseNumber(
+    process.env.ENGINE_PORT,
+    fileConfig.engine?.port ?? DEFAULT_CONFIG.engine.port,
   );
 
   return {
-    freecycle: {
-      host: freecycleHost,
-      port: freecyclePort,
-    },
-    ollama: {
-      host: ollamaHost,
-      port: ollamaPort,
+    servers,
+    engine: {
+      host: engineHost,
+      port: enginePort,
     },
     timeouts: {
       requestSecs: parseNumber(
@@ -186,10 +222,79 @@ export function getConfig(): McpServerConfig {
     return cachedConfig;
   }
 
-  cachedConfig = mergeConfig(readConfigFile(getConfigPath()));
+  const configPath = getConfigPath();
+
+  // If the config file is missing, write defaults to disk so users have a
+  // starting point to edit. Fatal if the write fails.
+  if (!existsSync(configPath)) {
+    try {
+      const configDir = dirname(configPath);
+      if (!existsSync(configDir)) {
+        mkdirSync(configDir, { recursive: true });
+      }
+      writeFileSync(configPath, JSON.stringify(DEFAULT_CONFIG, null, 2), "utf8");
+    } catch (err: unknown) {
+      throw new Error(
+        `Config file not found at ${configPath} and could not be recreated: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  cachedConfig = mergeConfig(readConfigFile(configPath));
   return cachedConfig;
 }
 
 export function resetConfigCache(): void {
   cachedConfig = null;
+}
+
+export function getActiveServer(): ServerEntry {
+  const config = getConfig();
+  const approved = config.servers?.find((entry) => entry.approved);
+  if (approved != null) {
+    return approved;
+  }
+
+  // Fallback to first server if none approved
+  if (config.servers != null && config.servers.length > 0) {
+    return config.servers[0]!;
+  }
+
+  // Absolute fallback
+  return DEFAULT_SERVER;
+}
+
+export function saveConfig(patch: Partial<McpServerConfig>): void {
+  const configPath = getConfigPath();
+  const fileConfig = readConfigFile(configPath);
+
+  // Merge patch into file config
+  const updated = {
+    ...fileConfig,
+    ...patch,
+  };
+
+  const configDir = dirname(configPath);
+  const tempPath = `${configPath}.tmp`;
+
+  try {
+    // Write to temp file first (atomic-ish)
+    writeFileSync(tempPath, JSON.stringify(updated, null, 2), "utf8");
+    // Atomic rename (within same directory)
+    const fs = require("node:fs");
+    fs.renameSync(tempPath, configPath);
+  } catch (err) {
+    // Clean up temp file if write failed
+    try {
+      if (existsSync(tempPath)) {
+        require("node:fs").unlinkSync(tempPath);
+      }
+    } catch {
+      // Ignore cleanup error
+    }
+    throw err;
+  }
+
+  // Reset cache so next read sees new values
+  resetConfigCache();
 }

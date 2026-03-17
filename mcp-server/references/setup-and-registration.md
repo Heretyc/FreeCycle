@@ -6,7 +6,6 @@ Use this file for install, registration, and first-run checks.
 
 - Node.js 18 or newer.
 - FreeCycle running locally or reachable on the network.
-- Ollama installed on the FreeCycle machine.
 - A valid MAC address and broadcast route if wake-on-LAN is enabled.
 
 ## Install
@@ -19,19 +18,48 @@ npm run build
 
 ## Registration
 
-Claude Code:
+### Claude Code (from within mcp-server/)
+
+If you are in the `mcp-server/` directory:
 
 ```bash
 claude mcp add freecycle node dist/index.js
 ```
 
-Claude Code with external config:
+### Claude Code (with explicit --cwd)
+
+Run from any directory with an absolute path to the `mcp-server/` folder. On Windows with Dropbox:
 
 ```bash
-claude mcp add freecycle -e FREECYCLE_MCP_CONFIG=C:\\path\\to\\freecycle-mcp.config.json node dist/index.js
+claude mcp add freecycle --cwd "C:\Users\<user>\Dropbox\freecycle\mcp-server" node dist/index.js
 ```
 
-OpenAI Codex:
+Replace `<user>` with your Windows username.
+
+### Claude Code with external config
+
+If your config file is at a custom path:
+
+```bash
+claude mcp add freecycle \
+  --cwd "C:\Users\<user>\Dropbox\freecycle\mcp-server" \
+  -e FREECYCLE_MCP_CONFIG="C:\Users\<user>\Dropbox\freecycle\mcp-server\freecycle-mcp.config.json" \
+  node dist/index.js
+```
+
+### Verification
+
+After registration, confirm the server was added:
+
+```bash
+claude mcp list
+```
+
+You should see `freecycle` in the list. If not, run the command again and check for error messages.
+
+### OpenAI Codex
+
+Add this to your Codex config file:
 
 ```json
 {
@@ -49,16 +77,18 @@ OpenAI Codex:
 
 ## First-Run Checklist
 
-1. Confirm `dist/index.js` exists after `npm run build`.
+1. Run `npm run build` in `mcp-server/` to ensure `dist/index.js` is current.
 2. Confirm the intended config path exists if `FREECYCLE_MCP_CONFIG` is set.
-3. Confirm the target FreeCycle host and Ollama host are reachable.
-4. Call `freecycle_check_availability` before attempting inference or model pulls.
-5. If local inference is unavailable, read `references/failure-recovery.md` instead of retrying blind.
+3. Use `claude mcp add` with `--cwd` to register (see Registration above).
+4. Run `claude mcp list` to verify registration succeeded.
+5. Confirm the target FreeCycle host and Ollama host are reachable.
+6. Call `freecycle_check_availability` before attempting inference or model pulls.
+7. If local inference is unavailable, read `references/failure-recovery.md` instead of retrying blind.
 
 ## Runtime Flow
 
-1. Check Ollama first.
-2. If Ollama is down, check FreeCycle.
+1. Check the FreeCycle Inference API first.
+2. If local inference is down, check FreeCycle status.
 3. If FreeCycle is unreachable and wake-on-LAN is enabled, send wake packets and wait.
 4. If the stack never becomes reachable, return a structured cloud fallback payload.
 
