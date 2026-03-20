@@ -11,6 +11,8 @@ use crate::notifications::{self, BalloonKind};
 use crate::state::{FreeCycleStatus, ManualOverride};
 use crate::{AppState, REMOTE_MODEL_INSTALL_UNLOCK_DURATION};
 use std::collections::HashSet;
+use std::io::Write as _;
+use std::process::Stdio;
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,10 +27,12 @@ use windows_sys::Win32::System::Power::{
     RegisterSuspendResumeNotification, UnregisterSuspendResumeNotification, HPOWERNOTIFY,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, RegisterClassW,
-    SetWindowLongPtrW, UnregisterClassW, CREATESTRUCTW, DEVICE_NOTIFY_WINDOW_HANDLE, GWLP_USERDATA,
-    HMENU, HWND_MESSAGE, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
-    WINDOW_EX_STYLE, WM_DESTROY, WM_NCCREATE, WM_POWERBROADCAST, WNDCLASSW, WS_OVERLAPPED,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, MessageBoxW,
+    RegisterClassW, SetWindowLongPtrW, UnregisterClassW, CREATESTRUCTW,
+    DEVICE_NOTIFY_WINDOW_HANDLE, GWLP_USERDATA, HMENU, HWND_MESSAGE, IDOK,
+    MB_ICONQUESTION, MB_OKCANCEL, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
+    PBT_APMSUSPEND, WINDOW_EX_STYLE, WM_DESTROY, WM_NCCREATE, WM_POWERBROADCAST,
+    WNDCLASSW, WS_OVERLAPPED,
 };
 
 /// RGBA color values for each tray icon state.
@@ -421,6 +425,104 @@ fn build_tooltip(state: &AppState) -> String {
     tooltip_lines.join("\n")
 }
 
+/// Builds a diagnostic report for bug reports when the model catalog fails.
+fn build_diagnostics(state: &AppState) -> String {
+    let mut lines = Vec::new();
+
+    lines.push("FreeCycle Diagnostic Report".to_string());
+    lines.push("==========================".to_string());
+    lines.push(format!("Version: {}", env!("CARGO_PKG_VERSION")));
+    lines.push(format!(
+        "Platform: {} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
+
+    // GPU / VRAM
+    if state.vram_total_bytes > 0 {
+        let used_mb = state.vram_used_bytes / (1024 * 1024);
+        let total_mb = state.vram_total_bytes / (1024 * 1024);
+        lines.push(format!("VRAM: {} / {} MB", used_mb, total_mb));
+    } else {
+        lines.push("VRAM: unavailable".to_string());
+    }
+
+    // Ollama
+    lines.push(format!(
+        "Ollama: {} (port {})",
+        if state.ollama_running { "running" } else { "stopped" },
+        state.config.ollama.port
+    ));
+    lines.push(format!(
+        "Installed Models: {}",
+        state.installed_model_names.len()
+    ));
+    if !state.installed_model_names.is_empty() {
+        lines.push(format!("  {}", state.installed_model_names.join(", ")));
+    }
+
+    // Status
+    lines.push(format!("Status: {}", state.status.label()));
+    if let Some(override_mode) = state.manual_override {
+        lines.push(format!("Override: {}", override_mode.label()));
+    }
+
+    // Model catalog
+    match model_catalog::load_catalog() {
+        Ok(Some(catalog)) => {
+            lines.push(format!(
+                "Catalog: {} models (scraped {})",
+                catalog.models.len(),
+                catalog.scraped_at
+            ));
+        }
+        Ok(None) => {
+            lines.push("Catalog: file not found (scrape never completed)".to_string());
+        }
+        Err(e) => {
+            lines.push(format!("Catalog: error loading — {}", e));
+        }
+    }
+
+    // Agent server
+    lines.push(format!(
+        "Agent API: port {} ({})",
+        state.config.agent_server.port,
+        if state.config.agent_server.compatibility_mode {
+            "compatibility mode"
+        } else {
+            "secure mode"
+        }
+    ));
+
+    // Network
+    lines.push(format!("Local IP: {}", state.local_ip));
+
+    // Active errors from model progress
+    let errors: Vec<&str> = state
+        .model_status
+        .iter()
+        .filter(|s| s.starts_with("Failed:"))
+        .map(|s| s.as_str())
+        .collect();
+    if !errors.is_empty() {
+        lines.push("Errors:".to_string());
+        for e in errors {
+            lines.push(format!("  - {}", e));
+        }
+    }
+
+    // Blocking processes
+    if !state.blocking_processes.is_empty() {
+        lines.push(format!(
+            "Blocked by: {}",
+            state.blocking_processes.join(", ")
+        ));
+    }
+
+    lines.join("\n")
+}
+
 /// Runs the system tray icon and Windows message loop.
 ///
 /// This function blocks the calling thread (must be the main thread on Windows)
@@ -662,9 +764,40 @@ pub fn run_tray(
                         .arg(config_path)
                         .spawn();
                 } else if model_menu_error.as_ref().map(|e| e.id()) == Some(event.id()) {
+                    // Open GitHub issues page
                     let _ = std::process::Command::new("explorer")
                         .arg("https://github.com/Heretyc/FreeCycle/issues")
                         .spawn();
+
+                    // Offer to copy diagnostic details to clipboard
+                    let message = to_wide_null(
+                        "We can copy the error details to your clipboard so you can \
+                         paste them into a new Issue posting. Is that ok?"
+                    );
+                    let title = to_wide_null("FreeCycle");
+                    let result = MessageBoxW(
+                        std::ptr::null_mut(),
+                        message.as_ptr(),
+                        title.as_ptr(),
+                        MB_OKCANCEL | MB_ICONQUESTION,
+                    );
+
+                    if result == IDOK {
+                        let diagnostics = runtime.block_on(async {
+                            let s = state.read().await;
+                            build_diagnostics(&s)
+                        });
+
+                        if let Ok(mut child) = std::process::Command::new("clip")
+                            .stdin(Stdio::piped())
+                            .spawn()
+                        {
+                            if let Some(mut stdin) = child.stdin.take() {
+                                let _ = stdin.write_all(diagnostics.as_bytes());
+                            }
+                            let _ = child.wait();
+                        }
+                    }
                 } else {
                     // Undo automatic toggle on model library CheckMenuItems (read-only display)
                     for (_, item) in &model_menu_items {
