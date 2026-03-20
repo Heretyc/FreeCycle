@@ -1511,3 +1511,118 @@ async def send_wake_on_lan_packets(config: WakeOnLanConfig) -> None:
         logger.warning(f"Wake-on-LAN failed: {e}")
     except ValueError as e:
         logger.warning(f"Wake-on-LAN configuration error: {e}")
+
+
+# ============================================================================
+# FreeCycle API Client (Port 7443)
+# ============================================================================
+
+async def fc_health_check(server: Optional[ServerEntry] = None) -> dict:
+    """Check health of the FreeCycle agent server."""
+    resolved = server or get_active_server()
+    base_url = f"https://{resolved.host}:{resolved.port}"
+    return await _request_json(f"{base_url}/health", method="GET", server=server)
+
+
+async def fc_get_status(server: Optional[ServerEntry] = None) -> dict:
+    """Get FreeCycle status including VRAM, processes, and engine state."""
+    resolved = server or get_active_server()
+    base_url = f"https://{resolved.host}:{resolved.port}"
+    return await _request_json(f"{base_url}/status", method="GET", server=server)
+
+
+# ============================================================================
+# FreeCycle API Client (Port 7443)
+# ============================================================================
+
+async def fc_health_check(server: Optional[ServerEntry] = None) -> dict:
+    """Check health of the FreeCycle agent server.
+    
+    Sends a GET request to /health endpoint on the FreeCycle agent server.
+    
+    Args:
+        server: Optional ServerEntry for routing. If None, uses active server.
+    
+    Returns:
+        Health check response dict with ok flag and status.
+    
+    Raises:
+        FreeCycleConnectionError: If connection fails.
+        FreeCycleTimeoutError: If request times out.
+    """
+    resolved = server or get_active_server()
+    base_url = f"https://{resolved.host}:{resolved.port}"
+    return await _request_json(f"{base_url}/health", method="GET", server=server)
+
+
+async def fc_get_status(server: Optional[ServerEntry] = None) -> dict:
+    """Get FreeCycle status including VRAM, processes, and engine state.
+    
+    Args:
+        server: Optional ServerEntry for routing.
+    
+    Returns:
+        Status dict with engine running flag, VRAM info, blocking processes.
+    """
+    resolved = server or get_active_server()
+    base_url = f"https://{resolved.host}:{resolved.port}"
+    return await _request_json(f"{base_url}/status", method="GET", server=server)
+
+
+async def fc_start_task(task_id: str, description: str, server: Optional[ServerEntry] = None) -> dict:
+    """Signal task start to the FreeCycle agent."""
+    resolved = server or get_active_server()
+    base_url = f"https://{resolved.host}:{resolved.port}"
+    body = {"task_id": task_id, "description": description}
+    return await _request_json(f"{base_url}/task/start", method="POST", body=json.dumps(body), server=server)
+
+
+async def fc_start_task_detailed(task_id: str, description: str, server: Optional[ServerEntry] = None) -> dict:
+    """Start task with detailed HTTP response info."""
+    resolved = server or get_active_server()
+    base_url = f"https://{resolved.host}:{resolved.port}"
+    body = {"task_id": task_id, "description": description}
+    return await _request_response(f"{base_url}/task/start", method="POST", body=json.dumps(body), server=server)
+
+
+async def fc_stop_task(task_id: str, server: Optional[ServerEntry] = None) -> dict:
+    """Signal task completion to the FreeCycle agent."""
+    resolved = server or get_active_server()
+    base_url = f"https://{resolved.host}:{resolved.port}"
+    body = {"task_id": task_id}
+    return await _request_json(f"{base_url}/task/stop", method="POST", body=json.dumps(body), server=server)
+
+
+async def fc_stop_task_detailed(task_id: str, server: Optional[ServerEntry] = None) -> dict:
+    """Stop task with detailed HTTP response info."""
+    resolved = server or get_active_server()
+    base_url = f"https://{resolved.host}:{resolved.port}"
+    body = {"task_id": task_id}
+    return await _request_response(f"{base_url}/task/stop", method="POST", body=json.dumps(body), server=server)
+
+
+async def fc_install_model(model_name: str, server: Optional[ServerEntry] = None) -> dict:
+    """Request model installation via FreeCycle."""
+    resolved = server or get_active_server()
+    base_url = f"https://{resolved.host}:{resolved.port}"
+    cfg = get_config()
+    timeout_secs = cfg.timeouts.pull_secs
+    body = {"model_name": model_name}
+    return await _request_json(f"{base_url}/models/install", method="POST", body=json.dumps(body), timeout_secs=timeout_secs, server=server)
+
+
+async def fc_install_model_detailed(model_name: str, server: Optional[ServerEntry] = None) -> dict:
+    """Install model with detailed HTTP response."""
+    resolved = server or get_active_server()
+    base_url = f"https://{resolved.host}:{resolved.port}"
+    cfg = get_config()
+    timeout_secs = cfg.timeouts.pull_secs
+    body = {"model_name": model_name}
+    return await _request_response(f"{base_url}/models/install", method="POST", body=json.dumps(body), timeout_secs=timeout_secs, server=server)
+
+
+async def fc_get_model_catalog(server: Optional[ServerEntry] = None) -> dict:
+    """Fetch the model catalog from FreeCycle."""
+    resolved = server or get_active_server()
+    base_url = f"https://{resolved.host}:{resolved.port}"
+    return await _request_json(f"{base_url}/models/catalog", method="GET", server=server)
