@@ -38,6 +38,7 @@ import socket
 import ssl
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -873,6 +874,12 @@ def save_config(patch: dict) -> None:
 # Module-level protocol cache: hostname → ("https" | "http", expiry_timestamp)
 _protocol_cache: dict[str, tuple[str, float]] = {}
 
+# Module-level HTTP connection pool: "scheme://host:port" → HTTPConnection/HTTPSConnection
+# Pooled connections are reused across requests for performance (esp. during benchmarks).
+# Thread-safe: _pool_lock is held only during dict mutation, never during I/O.
+_connection_pool: dict[str, http.client.HTTPConnection | http.client.HTTPSConnection] = {}
+_pool_lock = threading.Lock()
+
 
 def _raw_http_request(
     url: str,
@@ -885,7 +892,7 @@ def _raw_http_request(
 
     Performs a blocking HTTP/HTTPS request using http.client. Call this
     via asyncio.get_event_loop().run_in_executor() to avoid blocking the
-    event loop.
+    event loop. Uses persistent connection pooling for performance.
 
     Args:
         url: Full URL (must include scheme: https://... or http://...)
@@ -901,62 +908,100 @@ def _raw_http_request(
         FreeCycleConnectionError: On connection or SSL errors
         FreeCycleTimeoutError: On timeout
     """
-    try:
-        parsed = urlparse(url)
-        is_https = parsed.scheme == "https"
+    parsed = urlparse(url)
+    is_https = parsed.scheme == "https"
 
-        # Create SSL context with optional CERT_NONE for self-signed
+    # Determine port
+    port = parsed.port
+    if port is None:
+        port = 443 if is_https else 80
+
+    # Build pool key: "scheme://host:port"
+    pool_key = f"{parsed.scheme}://{parsed.hostname}:{port}"
+
+    def create_connection():
+        """Factory for creating a new HTTP(S) connection."""
         ssl_context = None
         if is_https and not verify_ssl:
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
 
-        # Determine port
-        port = parsed.port
-        if port is None:
-            port = 443 if is_https else 80
-
-        # Create connection
         if is_https:
-            conn = http.client.HTTPSConnection(
+            return http.client.HTTPSConnection(
                 parsed.hostname,
                 port,
                 timeout=timeout_secs,
                 context=ssl_context,
             )
         else:
-            conn = http.client.HTTPConnection(
+            return http.client.HTTPConnection(
                 parsed.hostname,
                 port,
                 timeout=timeout_secs,
             )
 
+    def make_request(conn) -> tuple[int, dict, bytes]:
+        """Execute request on a connection and return response."""
+        # Build path with query string
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        # Prepare headers
+        headers = {"Content-Type": "application/json"}
+        if body:
+            headers["Content-Length"] = str(len(body))
+
+        # Send request
+        conn.request(method, path, body=body, headers=headers)
+
+        # Read response
+        response = conn.getresponse()
+        status_code = response.status
+        response_body = response.read()
+
+        # Extract headers as dict
+        headers_dict = dict(response.headers)
+
+        return status_code, headers_dict, response_body
+
+    # Try to get a pooled connection
+    conn = None
+    try:
+        with _pool_lock:
+            conn = _connection_pool.pop(pool_key, None)
+
+        if conn is None:
+            conn = create_connection()
+
         try:
-            # Build path with query string
-            path = parsed.path or "/"
-            if parsed.query:
-                path = f"{path}?{parsed.query}"
-
-            # Prepare headers
-            headers = {"Content-Type": "application/json"}
-            if body:
-                headers["Content-Length"] = str(len(body))
-
-            # Send request
-            conn.request(method, path, body=body, headers=headers)
-
-            # Read response
-            response = conn.getresponse()
-            status_code = response.status
-            response_body = response.read()
-
-            # Extract headers as dict
-            headers_dict = dict(response.headers)
-
-            return status_code, headers_dict, response_body
-        finally:
-            conn.close()
+            # Try the request with current connection
+            result = make_request(conn)
+            # Success: return connection to pool
+            with _pool_lock:
+                _connection_pool[pool_key] = conn
+            return result
+        except (http.client.RemoteDisconnected, ConnectionResetError):
+            # Stale connection: close it, create fresh, retry once
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = create_connection()
+            try:
+                result = make_request(conn)
+                # Success on retry: return connection to pool
+                with _pool_lock:
+                    _connection_pool[pool_key] = conn
+                return result
+            except Exception:
+                # Retry failed: close and raise
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                raise
 
     except socket.timeout as e:
         raise FreeCycleTimeoutError(f"Request to {url} timed out: {e}")
@@ -1220,3 +1265,118 @@ async def secure_fetch(
     raise FreeCycleConnectionError(
         f"Connection to {cache_key} failed. HTTPS: {https_msg}. HTTP fallback: {http_msg}"
     )
+
+
+# ============================================================================
+# Async HTTP Client Foundation
+# ============================================================================
+
+def _extract_response_message(parsed: Any, fallback: str) -> str:
+    """Extract error message from response body.
+
+    Tries to extract the 'message' field from a JSON response dict,
+    falling back to a JSON slice if the field is missing or empty.
+
+    Args:
+        parsed: Parsed JSON response body (dict or other)
+        fallback: Fallback message if extraction fails
+
+    Returns:
+        Extracted message string or fallback
+    """
+    if not isinstance(parsed, dict):
+        return fallback
+
+    candidate = parsed.get("message")
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate
+
+    return fallback
+
+
+async def _request_response(
+    url: str,
+    method: str = "GET",
+    body: Optional[bytes] = None,
+    timeout_secs: Optional[float] = None,
+    server: Optional[ServerEntry] = None,
+) -> dict[str, Any]:
+    """Fetch a JSON response without raising on non-2xx status.
+
+    Calls secure_fetch, parses the response as JSON, and returns a dict
+    with status code, ok flag, and parsed body. Non-2xx responses are
+    returned normally (not raised as errors).
+
+    Args:
+        url: URL to fetch
+        method: HTTP method (GET, POST, etc.)
+        body: Request body as bytes
+        timeout_secs: Request timeout in seconds
+        server: ServerEntry for TOFU verification (optional)
+
+    Returns:
+        Dict with keys: status (int), ok (bool), body (parsed JSON)
+
+    Raises:
+        FreeCycleConnectionError: If response is not valid JSON
+        FreeCycleTimeoutError: On timeout
+    """
+    if timeout_secs is None:
+        timeout_secs = get_config().timeouts.request_secs
+
+    status_code, _, response_body = await secure_fetch(
+        url, entry=server, method=method, body=body, timeout_secs=timeout_secs
+    )
+
+    # Parse JSON response
+    try:
+        parsed = json.loads(response_body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        body_slice = response_body.decode("utf-8", errors="replace")[:200]
+        raise FreeCycleConnectionError(
+            f"Non-JSON response from {url}: {body_slice}"
+        )
+
+    ok = 200 <= status_code < 300
+
+    return {"status": status_code, "ok": ok, "body": parsed}
+
+
+async def _request_json(
+    url: str,
+    method: str = "GET",
+    body: Optional[bytes] = None,
+    timeout_secs: Optional[float] = None,
+    server: Optional[ServerEntry] = None,
+) -> Any:
+    """Fetch a JSON response, raising on non-2xx status.
+
+    Calls _request_response and raises FreeCycleConnectionError if the
+    status code is not in the 2xx range. Returns the parsed response body
+    on success.
+
+    Args:
+        url: URL to fetch
+        method: HTTP method (GET, POST, etc.)
+        body: Request body as bytes
+        timeout_secs: Request timeout in seconds
+        server: ServerEntry for TOFU verification (optional)
+
+    Returns:
+        Parsed JSON response body (any type)
+
+    Raises:
+        FreeCycleConnectionError: On non-2xx status or invalid JSON
+        FreeCycleTimeoutError: On timeout
+    """
+    response = await _request_response(url, method, body, timeout_secs, server)
+
+    if not response["ok"]:
+        status = response["status"]
+        body = response["body"]
+        message = _extract_response_message(
+            body, json.dumps(body)[:200] if body else "Unknown error"
+        )
+        raise FreeCycleConnectionError(f"HTTP {status} from {url}: {message}")
+
+    return response["body"]
