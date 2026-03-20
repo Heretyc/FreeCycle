@@ -332,6 +332,12 @@ fn build_tooltip(state: &AppState) -> String {
     };
     lines.push(status_line);
 
+    // FreeCycle listening address (high priority — always visible)
+    lines.push(format!(
+        "Listening on {}:{}",
+        state.local_ip, state.config.agent_server.port
+    ));
+
     if let Some(remaining) = state.remote_model_install_unlock_remaining(now) {
         lines.push(format!(
             "Remote installs: {}",
@@ -393,12 +399,6 @@ fn build_tooltip(state: &AppState) -> String {
             lines.push(status.clone());
         }
     }
-
-    // FreeCycle listening address
-    lines.push(format!(
-        "Listening on {}:{}",
-        state.local_ip, state.config.agent_server.port
-    ));
 
     let mut tooltip_lines: Vec<String> = Vec::new();
     let mut total_len = 0usize;
@@ -1123,20 +1123,17 @@ mod tests {
     }
 
     #[test]
-    fn test_tooltip_prefers_download_progress_over_listening_address() {
+    fn test_tooltip_always_shows_listening_address() {
         let config = crate::config::FreeCycleConfig::default();
         let mut state = AppState::new(config);
         state.status = FreeCycleStatus::Available;
         state.ollama_running = true;
         state.vram_used_bytes = 2 * 1024 * 1024 * 1024;
         state.vram_total_bytes = 8 * 1024u64 * 1024 * 1024;
-        state.remote_model_install_unlocked_until =
-            Some(Instant::now() + Duration::from_secs(3500));
         state.model_status = vec!["Downloading llama3.1:8b-instruct-q4_K_M: 42%".to_string()];
 
         let tooltip = build_tooltip(&state);
-        assert!(tooltip.contains("42%"));
-        assert!(!tooltip.contains("Listening on"));
+        assert!(tooltip.contains("Listening on"));
     }
 
     #[test]
