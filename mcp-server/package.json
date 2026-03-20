@@ -1,6 +1,6 @@
 {
   "name": "@freecycle/mcp-server",
-  "version": "1.0.51",
+  "version": "1.0.53",
   "description": "MCP server for FreeCycle GPU-aware Ollama lifecycle manager",
   "type": "module",
   "main": "dist/index.js",
