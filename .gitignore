@@ -21,6 +21,14 @@ target
 .idea/
 
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Node.js
+node_modules/
+
 # Added by cargo
 
 /target

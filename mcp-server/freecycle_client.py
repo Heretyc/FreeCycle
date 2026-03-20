@@ -344,6 +344,10 @@ __all__ = [
     "extract_server_fingerprint",
     "verify_fingerprint",
     "secure_fetch",
+    # Wake-on-LAN
+    "normalize_mac_address",
+    "create_magic_packet",
+    "send_wake_on_lan_packets",
     # Module functions (to be added in later tasks)
     # "FreeCycleClient",  # Will be added when the class is defined
     # ... sync wrappers, CLI helpers, etc.
@@ -1380,3 +1384,130 @@ async def _request_json(
         raise FreeCycleConnectionError(f"HTTP {status} from {url}: {message}")
 
     return response["body"]
+
+
+# ============================================================================
+# Wake-on-LAN
+# ============================================================================
+
+def normalize_mac_address(mac_address: str) -> bytes:
+    """Normalize a MAC address string to 6 raw bytes.
+
+    Strips all non-hexadecimal characters and validates that exactly 12
+    hex digits remain. Converts pairs of hex digits to bytes.
+
+    Args:
+        mac_address: MAC address string (e.g., "AA:BB:CC:DD:EE:FF" or
+            "AABBCCDDEEFF" or any other hex-separated format)
+
+    Returns:
+        Bytes object with 6 bytes (MAC address in binary form)
+
+    Raises:
+        ValueError: If the input does not contain exactly 12 hexadecimal
+            characters after stripping separators
+    """
+    # Strip all non-hex characters
+    sanitized = "".join(c for c in mac_address if c in "0123456789ABCDEFabcdef")
+
+    if len(sanitized) != 12:
+        raise ValueError(
+            "wakeOnLan.macAddress must contain exactly 12 hexadecimal characters."
+        )
+
+    # Convert pairs to bytes
+    mac_bytes = bytes(int(sanitized[i*2:i*2+2], 16) for i in range(6))
+    return mac_bytes
+
+
+def create_magic_packet(mac_bytes: bytes) -> bytes:
+    """Create a Wake-on-LAN magic packet.
+
+    Constructs the standard WoL magic packet format: 6 bytes of 0xFF
+    followed by the MAC address repeated 16 times (102 bytes total).
+
+    Args:
+        mac_bytes: 6-byte MAC address (binary form, e.g., from normalize_mac_address)
+
+    Returns:
+        102-byte magic packet (6 + 16*6)
+
+    Raises:
+        ValueError: If mac_bytes is not exactly 6 bytes
+    """
+    if len(mac_bytes) != 6:
+        raise ValueError("MAC address must be exactly 6 bytes")
+
+    # 6 bytes of 0xFF followed by 16 copies of the MAC address
+    packet = b"\xff" * 6 + mac_bytes * 16
+    return packet
+
+
+def _send_wol_packet(packet: bytes, broadcast_address: str, port: int) -> None:
+    """Send a single WoL magic packet via UDP broadcast.
+
+    Internal helper for send_wake_on_lan_packets. Binds a UDP socket,
+    enables broadcast mode, sends the packet, and closes the socket.
+
+    Args:
+        packet: Magic packet bytes (102 bytes)
+        broadcast_address: Broadcast address (e.g., "255.255.255.255")
+        port: Destination port (typically 9 for WoL)
+
+    Raises:
+        OSError: If socket binding or sending fails
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(packet, (broadcast_address, port))
+    finally:
+        sock.close()
+
+
+async def send_wake_on_lan_packets(config: WakeOnLanConfig) -> None:
+    """Send Wake-on-LAN magic packets to wake a remote host.
+
+    Sends multiple magic packets via UDP broadcast, with configurable
+    packet count and interval. Failures are logged but do not raise
+    exceptions (graceful failure contract).
+
+    This function is typically called by ensure_local_availability() when
+    the FreeCycle server is unreachable and WoL is enabled.
+
+    Args:
+        config: WakeOnLanConfig object with MAC address, broadcast address,
+            port, packet count, and interval settings
+
+    Returns:
+        None (always succeeds, failures are logged only)
+
+    Example:
+        >>> from freecycle_client import WakeOnLanConfig, send_wake_on_lan_packets
+        >>> config = WakeOnLanConfig(
+        ...     enabled=True,
+        ...     mac_address="AA:BB:CC:DD:EE:FF",
+        ...     broadcast_address="255.255.255.255",
+        ...     port=9,
+        ...     packet_count=5,
+        ...     packet_interval_secs=0.25
+        ... )
+        >>> await send_wake_on_lan_packets(config)
+    """
+    try:
+        # Normalize and validate MAC address
+        mac_bytes = normalize_mac_address(config.mac_address)
+        # Create magic packet
+        packet = create_magic_packet(mac_bytes)
+
+        # Send packets with configurable interval
+        for sent in range(config.packet_count):
+            _send_wol_packet(packet, config.broadcast_address, config.port)
+            # Sleep between packets (but not after the last one)
+            if sent < config.packet_count - 1:
+                await asyncio.sleep(config.packet_interval_secs)
+
+    except (OSError, socket.error) as e:
+        logger.warning(f"Wake-on-LAN failed: {e}")
+    except ValueError as e:
+        logger.warning(f"Wake-on-LAN configuration error: {e}")
