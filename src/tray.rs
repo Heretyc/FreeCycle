@@ -588,6 +588,8 @@ pub fn run_tray(
     // Model Library submenu state
     let mut model_menu_items: Vec<(String, CheckMenuItem)> = Vec::new();
     let mut model_menu_loading: Option<MenuItem> = Some(item_models_loading);
+    let mut model_menu_error: Option<MenuItem> = None;
+    let mut model_menu_empty_since: Option<Instant> = Some(Instant::now());
     let mut model_menu_catalog_names: Vec<String> = Vec::new();
     let mut model_menu_installed: HashSet<String> = HashSet::new();
     let mut model_menu_last_check = Instant::now() - Duration::from_secs(60); // force first check
@@ -658,6 +660,10 @@ pub fn run_tray(
                     let config_path = crate::config::config_path();
                     let _ = std::process::Command::new("notepad")
                         .arg(config_path)
+                        .spawn();
+                } else if model_menu_error.as_ref().map(|e| e.id()) == Some(event.id()) {
+                    let _ = std::process::Command::new("explorer")
+                        .arg("https://github.com/Heretyc/FreeCycle/issues")
                         .spawn();
                 } else {
                     // Undo automatic toggle on model library CheckMenuItems (read-only display)
@@ -806,16 +812,37 @@ pub fn run_tray(
                     if let Some(loading) = model_menu_loading.take() {
                         submenu_models.remove(&loading).ok();
                     }
+                    if let Some(error) = model_menu_error.take() {
+                        submenu_models.remove(&error).ok();
+                    }
                     for (_, item) in &model_menu_items {
                         submenu_models.remove(item).ok();
                     }
                     model_menu_items.clear();
 
                     if catalog_names.is_empty() {
-                        let placeholder = MenuItem::new("Loading...", false, None);
-                        submenu_models.append(&placeholder).ok();
-                        model_menu_loading = Some(placeholder);
+                        let timed_out = model_menu_empty_since
+                            .map(|since| since.elapsed() >= Duration::from_secs(120))
+                            .unwrap_or(false);
+
+                        if timed_out {
+                            let item = MenuItem::new(
+                                "Something broke! Let us know",
+                                true,
+                                None,
+                            );
+                            submenu_models.append(&item).ok();
+                            model_menu_error = Some(item);
+                        } else {
+                            if model_menu_empty_since.is_none() {
+                                model_menu_empty_since = Some(Instant::now());
+                            }
+                            let placeholder = MenuItem::new("Loading...", false, None);
+                            submenu_models.append(&placeholder).ok();
+                            model_menu_loading = Some(placeholder);
+                        }
                     } else {
+                        model_menu_empty_since = None;
                         for name in &catalog_names {
                             let checked = installed_base.contains(name.as_str());
                             let item = CheckMenuItem::new(name, true, checked, None);
