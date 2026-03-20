@@ -1,6 +1,6 @@
 [package]
 name = "freecycle"
-version = "1.0.53"
+version = "1.0.54"
 edition = "2021"
 rust-version = "1.75"
 description = "GPU-aware Ollama lifecycle manager for Windows. Monitors for games and GPU-intensive programs, automatically enabling/disabling networked Ollama access when the GPU is available."
