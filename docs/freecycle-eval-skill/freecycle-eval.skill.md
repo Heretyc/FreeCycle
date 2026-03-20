@@ -1,5 +1,6 @@
 ---
 name: freecycle-eval
+version: "2.0.1"
 description: |
   Evaluates whether to use the local FreeCycle Inference API,
   cloud LLMs (Claude/OpenAI), or a hybrid approach for agentic workflows.

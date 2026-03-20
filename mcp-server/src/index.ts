@@ -18,7 +18,7 @@ import { registerTools } from "./tools.js";
 
 const server = new McpServer({
   name: "freecycle-mcp",
-  version: "0.1.0",
+  version: "2.0.1",
 });
 
 registerTools(server);

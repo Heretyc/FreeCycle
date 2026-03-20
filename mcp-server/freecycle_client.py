@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, Union
 from urllib.parse import urlparse
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 logger = logging.getLogger("freecycle_client")
 
