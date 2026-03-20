@@ -10,12 +10,16 @@ use crate::{AppState, ModelProgress, ModelTransferKind};
 use anyhow::{Context, Result};
 use rusqlite;
 use serde::Deserialize;
+use std::os::windows::process::CommandExt as _;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, RwLock};
 use tracing::{debug, error, info, warn};
+
+/// Windows process creation flag: suppress console window for spawned processes.
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 fn log_ollama_request(method: &str, url: &str, body: &str) {
     let body_preview = scrub_http_preview_default(body);
@@ -177,6 +181,34 @@ async fn process_pull_stream_tail(
     }
 }
 
+/// Lists all model names currently installed in Ollama via `/api/tags`.
+///
+/// Returns an empty vector on any failure (timeout, connection error, parse error).
+pub async fn list_installed_models(base_url: &str) -> Vec<String> {
+    let url = format!("{}/api/tags", base_url);
+    let client = reqwest::Client::new();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), client.get(&url).send()).await;
+
+    let response = match result {
+        Ok(Ok(resp)) if resp.status().is_success() => resp,
+        _ => return Vec::new(),
+    };
+
+    match response.json::<serde_json::Value>().await {
+        Ok(json) => json
+            .get("models")
+            .and_then(|m| m.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Checks whether Ollama is installed on the system.
 ///
 /// Searches for `ollama.exe` in the configured path, PATH, and common
@@ -216,7 +248,7 @@ fn find_ollama_exe(config: &FreeCycleConfig) -> Option<String> {
     }
 
     // Check PATH via `where ollama`
-    if let Ok(output) = std::process::Command::new("where").arg("ollama").output() {
+    if let Ok(output) = std::process::Command::new("where").arg("ollama").creation_flags(CREATE_NO_WINDOW).output() {
         if output.status.success() {
             if let Ok(path) = String::from_utf8(output.stdout) {
                 let first_line = path.lines().next().unwrap_or("").trim();
@@ -272,6 +304,7 @@ async fn start_ollama(config: &FreeCycleConfig) -> Result<Child> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(false)
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .with_context(|| format!("Failed to spawn Ollama: {}", exe))?;
 
@@ -298,6 +331,7 @@ async fn stop_ollama(child: &mut Child, timeout_secs: u64) {
     // gracefully via taskkill /PID
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string()])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
 
     // Wait for process to exit
@@ -319,6 +353,7 @@ async fn stop_ollama(child: &mut Child, timeout_secs: u64) {
             // Also try taskkill /F as a fallback
             let _ = std::process::Command::new("taskkill")
                 .args(["/F", "/PID", &pid.to_string()])
+                .creation_flags(CREATE_NO_WINDOW)
                 .output();
         }
     }
@@ -340,6 +375,7 @@ pub fn kill_existing_ollama() {
             .args(["/F", "/IM", process_name])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
             .output();
     }
     // Brief pause so the OS releases file handles (including the SQLite lock)
@@ -530,6 +566,18 @@ pub async fn run_model_manager(
     // Give Ollama a moment to fully initialize
     tokio::time::sleep(Duration::from_secs(5)).await;
 
+    // Initial installed model list refresh
+    {
+        let base_url = {
+            let s = state.read().await;
+            format!("http://{}:{}", s.config.ollama.secure_host, s.config.ollama.port)
+        };
+        let installed = list_installed_models(&base_url).await;
+        let mut s = state.write().await;
+        info!("Initial installed model scan: {} models", installed.len());
+        s.installed_model_names = installed;
+    }
+
     let mut last_update_check = std::time::Instant::now();
 
     loop {
@@ -599,6 +647,13 @@ pub async fn run_model_manager(
 
         if should_update {
             last_update_check = std::time::Instant::now();
+        }
+
+        // Refresh installed model list in shared state
+        if ollama_running {
+            let installed = list_installed_models(&base_url).await;
+            let mut s = state.write().await;
+            s.installed_model_names = installed;
         }
 
         // Wait for next check

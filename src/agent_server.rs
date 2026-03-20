@@ -1112,6 +1112,7 @@ mod tests {
             model_progress: Vec::new(),
             model_status: Vec::new(),
             models_downloading: false,
+            installed_model_names: Vec::new(),
             notification_hwnd: None,
         }))
     }

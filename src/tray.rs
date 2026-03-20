@@ -6,9 +6,11 @@
 //! with VRAM usage, Ollama status, IP/port, and active task info.
 
 use crate::lockfile::ProcessLock;
+use crate::model_catalog;
 use crate::notifications::{self, BalloonKind};
 use crate::state::{FreeCycleStatus, ManualOverride};
 use crate::{AppState, REMOTE_MODEL_INSTALL_UNLOCK_DURATION};
+use std::collections::HashSet;
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -16,7 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::{watch, RwLock};
 use tracing::{debug, info, warn};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIconBuilder};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::Power::{
@@ -509,9 +511,21 @@ pub fn run_tray(
         );
     }
 
+    // Determine initial autostart label
+    let initial_autostart = runtime.block_on(async {
+        let s = state.read().await;
+        s.config.general.autostart
+    });
+    let initial_autostart_label = if initial_autostart {
+        "\u{2713} Start with Windows"
+    } else {
+        "  Start with Windows"
+    };
+
     // Build context menu
     let menu = Menu::new();
     let item_status = MenuItem::new("Status: Initializing", false, None);
+    let item_autostart = MenuItem::new(initial_autostart_label, true, None);
     let item_force_enable = MenuItem::new("Force Enable Ollama", true, None);
     let item_force_disable = MenuItem::new("Force Disable Ollama", true, None);
     let item_remote_model_installs =
@@ -520,11 +534,19 @@ pub fn run_tray(
     let item_open_config = MenuItem::new("Open Config", true, None);
     let item_quit = MenuItem::new("Exit FreeCycle", true, None);
 
+    // Model Library submenu (populated dynamically)
+    let submenu_models = Submenu::new("Model Library", true);
+    let item_models_loading = MenuItem::new("Loading...", false, None);
+    submenu_models.append(&item_models_loading).ok();
+
     menu.append(&item_status).ok();
     menu.append(&PredefinedMenuItem::separator()).ok();
+    menu.append(&item_autostart).ok();
     menu.append(&item_force_enable).ok();
     menu.append(&item_force_disable).ok();
     menu.append(&item_remote_model_installs).ok();
+    menu.append(&PredefinedMenuItem::separator()).ok();
+    menu.append(&submenu_models).ok();
     menu.append(&PredefinedMenuItem::separator()).ok();
     menu.append(&item_open_logs).ok();
     menu.append(&item_open_config).ok();
@@ -558,9 +580,17 @@ pub fn run_tray(
     let mut last_color = COLOR_GREY;
     let mut last_update = Instant::now();
     let mut last_menu_label = "Status: Initializing".to_string();
+    let mut last_autostart_label = initial_autostart_label.to_string();
     let mut last_force_enable_enabled = true;
     let mut last_force_disable_enabled = true;
     let mut last_remote_model_install_label = "Enable Remote Model Installs (1 Hour)".to_string();
+
+    // Model Library submenu state
+    let mut model_menu_items: Vec<(String, CheckMenuItem)> = Vec::new();
+    let mut model_menu_loading: Option<MenuItem> = Some(item_models_loading);
+    let mut model_menu_catalog_names: Vec<String> = Vec::new();
+    let mut model_menu_installed: HashSet<String> = HashSet::new();
+    let mut model_menu_last_check = Instant::now() - Duration::from_secs(60); // force first check
 
     // Win32 message loop
     let tray_result = unsafe {
@@ -585,6 +615,24 @@ pub fn run_tray(
                         s.manual_override = Some(ManualOverride::ForceDisable);
                     });
                     info!("Tray override set: force disable Ollama");
+                } else if event.id() == item_autostart.id() {
+                    runtime.block_on(async {
+                        let mut s = state.write().await;
+                        s.config.general.autostart = !s.config.general.autostart;
+                        let enabled = s.config.general.autostart;
+                        crate::autostart::sync_autostart(enabled);
+                        if let Err(e) = s.config.save() {
+                            warn!("Failed to save config after autostart toggle: {}", e);
+                        }
+                        let label = if enabled {
+                            "\u{2713} Start with Windows"
+                        } else {
+                            "  Start with Windows"
+                        };
+                        item_autostart.set_text(label);
+                        last_autostart_label = label.to_string();
+                        info!("Tray autostart toggled: enabled={}", enabled);
+                    });
                 } else if event.id() == item_remote_model_installs.id() {
                     runtime.block_on(async {
                         let mut s = state.write().await;
@@ -611,6 +659,14 @@ pub fn run_tray(
                     let _ = std::process::Command::new("notepad")
                         .arg(config_path)
                         .spawn();
+                } else {
+                    // Undo automatic toggle on model library CheckMenuItems (read-only display)
+                    for (_, item) in &model_menu_items {
+                        if event.id() == item.id() {
+                            item.set_checked(!item.is_checked());
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -625,6 +681,7 @@ pub fn run_tray(
                     new_color,
                     tooltip,
                     menu_label,
+                    autostart_label,
                     enable_force_enable,
                     enable_force_disable,
                     remote_model_install_label,
@@ -637,6 +694,11 @@ pub fn run_tray(
                     let color = status_color(&s.status, s.models_downloading);
                     let tooltip = build_tooltip(&s);
                     let menu_label = menu_status_label(&s.status, s.manual_override);
+                    let autostart_label = if s.config.general.autostart {
+                        "\u{2713} Start with Windows".to_string()
+                    } else {
+                        "  Start with Windows".to_string()
+                    };
                     let enable_force_enable = force_enable_item_enabled(s.manual_override);
                     let enable_force_disable = force_disable_item_enabled(s.manual_override);
                     let remote_model_install_label = remote_model_install_menu_label(&s, now);
@@ -644,6 +706,7 @@ pub fn run_tray(
                         color,
                         tooltip,
                         menu_label,
+                        autostart_label,
                         enable_force_enable,
                         enable_force_disable,
                         remote_model_install_label,
@@ -694,6 +757,10 @@ pub fn run_tray(
                     item_status.set_text(&menu_label);
                     last_menu_label = menu_label;
                 }
+                if autostart_label != last_autostart_label {
+                    item_autostart.set_text(&autostart_label);
+                    last_autostart_label = autostart_label;
+                }
                 if enable_force_enable != last_force_enable_enabled {
                     item_force_enable.set_enabled(enable_force_enable);
                     last_force_enable_enabled = enable_force_enable;
@@ -707,6 +774,82 @@ pub fn run_tray(
                     last_remote_model_install_label = remote_model_install_label;
                 }
                 last_update = Instant::now();
+            }
+
+            // Update Model Library submenu every 30 seconds
+            if model_menu_last_check.elapsed() >= Duration::from_secs(30) {
+                model_menu_last_check = Instant::now();
+
+                let catalog_opt = model_catalog::load_catalog().ok().flatten();
+                let installed_names: Vec<String> = runtime.block_on(async {
+                    let s = state.read().await;
+                    s.installed_model_names.clone()
+                });
+
+                let mut catalog_names: Vec<String> = catalog_opt
+                    .as_ref()
+                    .map(|c| c.models.iter().map(|m| m.name.clone()).collect())
+                    .unwrap_or_default();
+                catalog_names.sort();
+
+                // Build installed base name set (strip :tag suffixes for matching)
+                let installed_base: HashSet<String> = installed_names
+                    .iter()
+                    .map(|n| n.split(':').next().unwrap_or(n).to_string())
+                    .collect();
+
+                let catalog_changed = catalog_names != model_menu_catalog_names;
+                let installed_changed = installed_base != model_menu_installed;
+
+                if catalog_changed {
+                    // Full rebuild: remove all existing items
+                    if let Some(loading) = model_menu_loading.take() {
+                        submenu_models.remove(&loading).ok();
+                    }
+                    for (_, item) in &model_menu_items {
+                        submenu_models.remove(item).ok();
+                    }
+                    model_menu_items.clear();
+
+                    if catalog_names.is_empty() {
+                        let placeholder = MenuItem::new("Loading...", false, None);
+                        submenu_models.append(&placeholder).ok();
+                        model_menu_loading = Some(placeholder);
+                    } else {
+                        for name in &catalog_names {
+                            let checked = installed_base.contains(name.as_str());
+                            let item = CheckMenuItem::new(name, true, checked, None);
+                            submenu_models.append(&item).ok();
+                            model_menu_items.push((name.clone(), item));
+                        }
+                    }
+
+                    model_menu_catalog_names = catalog_names;
+                    model_menu_installed = installed_base;
+                } else if installed_changed {
+                    // Just update check states on existing items
+                    for (name, item) in &model_menu_items {
+                        let should_check = installed_base.contains(name.as_str());
+                        if item.is_checked() != should_check {
+                            item.set_checked(should_check);
+                        }
+                    }
+                    model_menu_installed = installed_base;
+                }
+
+                // Update submenu label with counts
+                if !model_menu_items.is_empty() {
+                    let installed_count = model_menu_items
+                        .iter()
+                        .filter(|(name, _)| model_menu_installed.contains(name.as_str()))
+                        .count();
+                    submenu_models
+                        .set_text(&format!(
+                            "Model Library ({}/{})",
+                            installed_count,
+                            model_menu_items.len()
+                        ));
+                }
             }
 
             // Pump Win32 messages (with a short timeout to stay responsive)

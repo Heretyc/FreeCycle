@@ -17,6 +17,7 @@ pub mod model_catalog;
 pub mod notifications;
 pub mod ollama;
 pub mod security;
+pub mod shortcut;
 pub mod state;
 pub mod tray;
 
@@ -134,6 +135,10 @@ pub struct AppState {
     /// Whether model downloads are currently in progress.
     pub models_downloading: bool,
 
+    /// Names of models currently installed in Ollama (from /api/tags).
+    /// Refreshed periodically by the model manager.
+    pub installed_model_names: Vec<String>,
+
     /// HWND for tray notification window (used by exposure monitor).
     /// Set by tray module when initialized.
     pub notification_hwnd: Option<isize>,
@@ -163,6 +168,7 @@ impl AppState {
             model_progress: Vec::new(),
             model_status: Vec::new(),
             models_downloading: false,
+            installed_model_names: Vec::new(),
             notification_hwnd: None,
         }
     }

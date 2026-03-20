@@ -294,11 +294,18 @@ pub async fn run_catalog_updater(
             _ = interval.tick() => {
                 // Check if catalog is stale or missing
                 let needs_update = match load_catalog() {
-                    Ok(Some(catalog)) => match catalog.is_stale() {
-                        Ok(stale) => stale,
-                        Err(e) => {
-                            warn!("Failed to check catalog age: {}", e);
+                    Ok(Some(catalog)) => {
+                        if catalog.models.is_empty() {
+                            info!("Model catalog exists but has no models; forcing refresh");
                             true
+                        } else {
+                            match catalog.is_stale() {
+                                Ok(stale) => stale,
+                                Err(e) => {
+                                    warn!("Failed to check catalog age: {}", e);
+                                    true
+                                }
+                            }
                         }
                     },
                     Ok(None) => true, // No catalog yet
@@ -317,6 +324,9 @@ pub async fn run_catalog_updater(
 
                 // Perform scrape
                 match scrape_model_library().await {
+                    Ok(models) if models.is_empty() => {
+                        warn!("Scrape returned zero models; this is abnormal — keeping existing catalog");
+                    }
                     Ok(models) => {
                         info!("Scraped {} models from ollama.com/library", models.len());
 
@@ -419,6 +429,20 @@ mod tests {
 
         let is_stale = catalog.is_stale().expect("Should parse timestamp");
         assert!(!is_stale, "Fresh catalog should not be stale");
+    }
+
+    #[test]
+    fn test_empty_catalog_treated_as_needing_update() {
+        let now = Utc::now();
+        let catalog = ModelCatalog {
+            scraped_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            synthesized: false,
+            models: Vec::new(),
+        };
+
+        // Even though the catalog is fresh, it has no models — should need refresh
+        assert!(!catalog.is_stale().unwrap(), "Fresh catalog should not be stale");
+        assert!(catalog.models.is_empty(), "Catalog with no models should trigger refresh");
     }
 
     #[test]
