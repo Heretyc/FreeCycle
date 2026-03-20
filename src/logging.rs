@@ -99,7 +99,7 @@ pub fn init_logging(verbose: bool) -> Result<LogGuard> {
             .with_target(true)
             .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339());
 
-        let filter = EnvFilter::new("debug");
+        let filter = EnvFilter::new("debug,selectors=warn,html5ever=warn");
 
         tracing_subscriber::registry()
             .with(filter)

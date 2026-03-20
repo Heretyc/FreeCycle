@@ -95,17 +95,22 @@ pub fn save_catalog(catalog: &ModelCatalog) -> Result<()> {
 
 /// Parse model cards from HTML content.
 ///
-/// Extracts model cards by looking for div elements with class "p-2" or similar structure
-/// that contains model information. This is a defensive parser that handles missing fields
-/// gracefully.
+/// Extracts model cards by finding anchor elements whose `href` points to
+/// `/library/<model-name>`. Multiple CSS selector patterns are tried in order;
+/// once any pattern yields results, the remaining patterns are skipped.
+/// The parser is defensive: missing fields are handled gracefully and
+/// duplicate model names are deduplicated.
 fn parse_model_cards_from_html(html: &str) -> Vec<ModelCard> {
     let document = Html::parse_document(html);
 
-    // Try multiple selector patterns to find model cards
+    // Multiple selector patterns, tried in priority order.
+    // The first pattern that yields any results wins (avoids double-counting).
     let selectors = vec![
-        // Primary selector: look for card-like divs with model links
+        // 2025+ layout: bare anchor cards linking to /library/<name>
+        "a[href^='/library/']",
+        // Legacy (pre-2025): card divs wrapping model links
         "div.p-2 a[href*='/library/']",
-        // Fallback: look for any link to a model
+        // Legacy fallback: role-annotated links
         "a[href*='/library/'][role='link']",
     ];
 
@@ -115,22 +120,26 @@ fn parse_model_cards_from_html(html: &str) -> Vec<ModelCard> {
     for selector_str in selectors {
         if let Ok(selector) = Selector::parse(selector_str) {
             for element in document.select(&selector) {
-                // Extract model name from href
                 let href = element.value().attr("href").unwrap_or("");
-                let model_name = href.trim_start_matches("/library/").to_string();
 
-                if model_name.is_empty() || seen_names.contains(&model_name) {
+                // Extract model name: "/library/llama3.2" → "llama3.2"
+                let model_name = href
+                    .strip_prefix("/library/")
+                    .unwrap_or("")
+                    .to_string();
+
+                // Skip empty names, the bare "/library" nav link, and duplicates
+                if model_name.is_empty()
+                    || model_name.contains('/')
+                    || seen_names.contains(&model_name)
+                {
                     continue;
                 }
                 seen_names.insert(model_name.clone());
 
-                // Extract text content (usually the model name or description)
-                let text = element.inner_html();
-                let description = text.trim().to_string();
-
                 models.push(ModelCard {
                     name: model_name,
-                    description,
+                    description: String::new(),
                     parameter_sizes: Vec::new(),
                     quantization_variants: Vec::new(),
                     tags: Vec::new(),
@@ -138,6 +147,11 @@ fn parse_model_cards_from_html(html: &str) -> Vec<ModelCard> {
                     last_updated: None,
                 });
             }
+        }
+
+        // If the current selector found models, don't try fallbacks
+        if !models.is_empty() {
+            break;
         }
     }
 
@@ -369,7 +383,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_model_card_from_html_fixture() {
+    fn test_parse_model_card_from_html_current_layout() {
+        // Current (2025+) layout: bare anchor elements with href="/library/<name>"
+        let html = r#"
+            <a href="/library/llama3.2">llama3.2 - A lightweight model</a>
+            <a href="/library/mistral">mistral - Fast inference</a>
+            <a href="/library">Library</a>
+        "#;
+
+        let models = parse_model_cards_from_html(html);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].name, "llama3.2");
+        assert_eq!(models[1].name, "mistral");
+    }
+
+    #[test]
+    fn test_parse_model_card_from_html_legacy_layout() {
+        // Legacy layout: div.p-2 wrapping anchor elements
         let html = r#"
             <div class="p-2">
                 <a href="/library/llama3.2">llama3.2</a>
