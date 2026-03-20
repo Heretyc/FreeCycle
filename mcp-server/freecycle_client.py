@@ -339,6 +339,10 @@ __all__ = [
     "reset_config_cache",
     "get_active_server",
     "save_config",
+    # TLS / TOFU Secure Client
+    "extract_server_fingerprint",
+    "verify_fingerprint",
+    "secure_fetch",
     # Module functions (to be added in later tasks)
     # "FreeCycleClient",  # Will be added when the class is defined
     # ... sync wrappers, CLI helpers, etc.
@@ -860,3 +864,359 @@ def save_config(patch: dict) -> None:
 
     _write_config_atomic(config_path, updated)
     reset_config_cache()
+
+
+# ============================================================================
+# TLS / TOFU Secure Client
+# ============================================================================
+
+# Module-level protocol cache: hostname → ("https" | "http", expiry_timestamp)
+_protocol_cache: dict[str, tuple[str, float]] = {}
+
+
+def _raw_http_request(
+    url: str,
+    method: str = "GET",
+    body: Optional[bytes] = None,
+    timeout_secs: Optional[float] = None,
+    verify_ssl: bool = True,
+) -> tuple[int, dict, bytes]:
+    """Synchronous core HTTP request (runs in executor).
+
+    Performs a blocking HTTP/HTTPS request using http.client. Call this
+    via asyncio.get_event_loop().run_in_executor() to avoid blocking the
+    event loop.
+
+    Args:
+        url: Full URL (must include scheme: https://... or http://...)
+        method: HTTP method (GET, POST, etc.)
+        body: Request body as bytes (for POST requests)
+        timeout_secs: Connection timeout in seconds
+        verify_ssl: If False, accept self-signed certificates
+
+    Returns:
+        Tuple of (status_code, headers_dict, response_body_bytes)
+
+    Raises:
+        FreeCycleConnectionError: On connection or SSL errors
+        FreeCycleTimeoutError: On timeout
+    """
+    try:
+        parsed = urlparse(url)
+        is_https = parsed.scheme == "https"
+
+        # Create SSL context with optional CERT_NONE for self-signed
+        ssl_context = None
+        if is_https and not verify_ssl:
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+
+        # Determine port
+        port = parsed.port
+        if port is None:
+            port = 443 if is_https else 80
+
+        # Create connection
+        if is_https:
+            conn = http.client.HTTPSConnection(
+                parsed.hostname,
+                port,
+                timeout=timeout_secs,
+                context=ssl_context,
+            )
+        else:
+            conn = http.client.HTTPConnection(
+                parsed.hostname,
+                port,
+                timeout=timeout_secs,
+            )
+
+        try:
+            # Build path with query string
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+
+            # Prepare headers
+            headers = {"Content-Type": "application/json"}
+            if body:
+                headers["Content-Length"] = str(len(body))
+
+            # Send request
+            conn.request(method, path, body=body, headers=headers)
+
+            # Read response
+            response = conn.getresponse()
+            status_code = response.status
+            response_body = response.read()
+
+            # Extract headers as dict
+            headers_dict = dict(response.headers)
+
+            return status_code, headers_dict, response_body
+        finally:
+            conn.close()
+
+    except socket.timeout as e:
+        raise FreeCycleTimeoutError(f"Request to {url} timed out: {e}")
+    except (ssl.SSLError, socket.error) as e:
+        raise FreeCycleConnectionError(f"Connection to {url} failed: {e}")
+    except Exception as e:
+        raise FreeCycleConnectionError(f"Request to {url} failed: {e}")
+
+
+async def extract_server_fingerprint(host: str, port: int) -> str:
+    """Extract SHA-256 fingerprint of a server's TLS certificate.
+
+    Performs a TLS handshake with the server, accepting self-signed
+    certificates, and extracts the SHA-256 fingerprint from the
+    DER-encoded certificate.
+
+    This function maps to Node.js extractServerFingerprint().
+
+    Args:
+        host: Server hostname or IP address
+        port: Server port number
+
+    Returns:
+        SHA-256 fingerprint as hex string (lowercase)
+
+    Raises:
+        FreeCycleConnectionError: If TLS handshake fails
+        FreeCycleTimeoutError: If handshake times out after 5 seconds
+    """
+    loop = asyncio.get_event_loop()
+
+    def _extract_sync():
+        """Synchronous core: create SSL socket, get cert, compute fingerprint."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5.0)  # 5-second timeout matching Node.js
+
+        try:
+            # Connect to server
+            sock.connect((host, port))
+
+            # Wrap socket with SSL context that accepts self-signed certs
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+
+            ssl_sock = ssl_context.wrap_socket(sock, server_hostname=host)
+
+            # Extract DER certificate
+            der_cert = ssl_sock.getpeercert(binary_form=True)
+            if not der_cert:
+                raise FreeCycleConnectionError(
+                    f"Failed to extract TLS certificate from {host}:{port}"
+                )
+
+            # Compute SHA-256 fingerprint
+            fingerprint = hashlib.sha256(der_cert).hexdigest()
+
+            ssl_sock.close()
+            return fingerprint
+
+        except socket.timeout:
+            raise FreeCycleTimeoutError(
+                f"TLS handshake with {host}:{port} timed out after 5 seconds"
+            )
+        except (ssl.SSLError, socket.error) as e:
+            raise FreeCycleConnectionError(
+                f"TLS connection to {host}:{port} failed: {e}"
+            )
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    return await loop.run_in_executor(None, _extract_sync)
+
+
+def verify_fingerprint(expected: str, actual: str) -> bool:
+    """Verify that two TLS fingerprints match.
+
+    Performs case-insensitive comparison of hex-encoded SHA-256 fingerprints.
+
+    Args:
+        expected: Expected fingerprint (from config)
+        actual: Actual fingerprint (from server certificate)
+
+    Returns:
+        True if fingerprints match (case-insensitive), False otherwise
+    """
+    return expected.lower() == actual.lower()
+
+
+async def secure_fetch(
+    url: str,
+    entry: Optional[ServerEntry] = None,
+    method: str = "GET",
+    body: Optional[bytes] = None,
+    timeout_secs: Optional[float] = None,
+) -> tuple[int, dict, bytes]:
+    """Secure HTTP fetch with TLS TOFU verification.
+
+    For known servers (with ServerEntry), accepts self-signed certificates
+    and optionally verifies TLS fingerprint. For unknown servers, uses
+    standard certificate validation with TLS-first, plaintext-fallback.
+
+    This function maps to Node.js secureFetch().
+
+    Args:
+        url: URL to fetch (may omit scheme; defaults to https://)
+        entry: ServerEntry if this is a known server (None for unknown servers)
+        method: HTTP method (GET, POST, etc.)
+        body: Request body as bytes
+        timeout_secs: Request timeout in seconds
+
+    Returns:
+        Tuple of (status_code, headers_dict, response_body_bytes)
+
+    Raises:
+        FreeCycleConnectionError: On network errors
+        FreeCycleTimeoutError: On timeout
+        TLSFingerprintMismatchError: If fingerprint verification fails
+    """
+    loop = asyncio.get_event_loop()
+
+    # Ensure URL has a scheme
+    if not url.startswith("https://") and not url.startswith("http://"):
+        url = f"https://{url}"
+
+    # Known server: accept self-signed, optionally verify fingerprint
+    if entry:
+        parsed = urlparse(url)
+        is_https = parsed.scheme == "https"
+
+        if is_https:
+            # Verify fingerprint if one is pinned
+            if entry.tls_fingerprint and entry.tls_fingerprint != "pending-verification":
+                try:
+                    actual_fingerprint = await extract_server_fingerprint(
+                        parsed.hostname, parsed.port or 443
+                    )
+                    if not verify_fingerprint(entry.tls_fingerprint, actual_fingerprint):
+                        raise TLSFingerprintMismatchError(
+                            f"TLS fingerprint mismatch for {parsed.hostname}:{parsed.port or 443}. "
+                            f"Expected: {entry.tls_fingerprint[:16]}..., "
+                            f"Got: {actual_fingerprint[:16]}... "
+                            f"This could indicate a man-in-the-middle attack or server "
+                            f"certificate rotation."
+                        )
+                except TLSFingerprintMismatchError:
+                    raise
+                except Exception as e:
+                    raise FreeCycleConnectionError(f"Failed to verify TLS fingerprint: {e}")
+
+            # Accept self-signed cert for known server
+            return await loop.run_in_executor(
+                None,
+                _raw_http_request,
+                url,
+                method,
+                body,
+                timeout_secs,
+                False,  # verify_ssl=False
+            )
+
+        # HTTP URL: request directly
+        return await loop.run_in_executor(
+            None,
+            _raw_http_request,
+            url,
+            method,
+            body,
+            timeout_secs,
+            True,  # verify_ssl=True (HTTP has no SSL)
+        )
+
+    # Unknown server: use cached protocol detection with fallback
+    parsed = urlparse(url)
+    cache_key = parsed.hostname
+
+    now = time.time()
+
+    # Check if cached as HTTP
+    if cache_key in _protocol_cache:
+        cached_protocol, expiry = _protocol_cache[cache_key]
+        if expiry > now and cached_protocol == "http":
+            http_url = url.replace("https://", "http://")
+            try:
+                return await loop.run_in_executor(
+                    None,
+                    _raw_http_request,
+                    http_url,
+                    method,
+                    body,
+                    timeout_secs,
+                    True,
+                )
+            except Exception:
+                # Cache miss: remove entry and continue
+                del _protocol_cache[cache_key]
+
+    # Check if cached as HTTPS
+    if cache_key in _protocol_cache:
+        cached_protocol, expiry = _protocol_cache[cache_key]
+        if expiry > now and cached_protocol == "https":
+            try:
+                return await loop.run_in_executor(
+                    None,
+                    _raw_http_request,
+                    url,
+                    method,
+                    body,
+                    timeout_secs,
+                    True,
+                )
+            except Exception:
+                # Cache miss: remove entry and continue
+                del _protocol_cache[cache_key]
+
+    # No valid cache: try HTTPS first, then HTTP
+    https_error = None
+    try:
+        result = await loop.run_in_executor(
+            None,
+            _raw_http_request,
+            url,
+            method,
+            body,
+            timeout_secs,
+            True,
+        )
+        # HTTPS succeeded: cache it
+        expiry = now + PROTOCOL_CACHE_TTL_SECS
+        _protocol_cache[cache_key] = ("https", expiry)
+        return result
+    except Exception as e:
+        https_error = e
+
+    # HTTPS failed: try HTTP
+    http_error = None
+    http_url = url.replace("https://", "http://")
+    try:
+        result = await loop.run_in_executor(
+            None,
+            _raw_http_request,
+            http_url,
+            method,
+            body,
+            timeout_secs,
+            True,
+        )
+        # HTTP succeeded: cache it
+        expiry = now + PROTOCOL_CACHE_TTL_SECS
+        _protocol_cache[cache_key] = ("http", expiry)
+        return result
+    except Exception as e:
+        http_error = e
+
+    # Both failed: raise with combined error info
+    https_msg = str(https_error) if https_error else "Unknown error"
+    http_msg = str(http_error) if http_error else "Unknown error"
+    raise FreeCycleConnectionError(
+        f"Connection to {cache_key} failed. HTTPS: {https_msg}. HTTP fallback: {http_msg}"
+    )
