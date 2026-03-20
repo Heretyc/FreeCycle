@@ -347,13 +347,8 @@ fn build_tooltip(state: &AppState) -> String {
         lines.push(format!("VRAM: {} / {} MB ({}%)", used_mb, total_mb, pct));
     }
 
-    // Ollama status and network info
-    if state.ollama_running {
-        lines.push(format!(
-            "Ollama: {}:{} (running)",
-            state.local_ip, state.config.ollama.port
-        ));
-    } else {
+    // Ollama status
+    if !state.ollama_running {
         lines.push("Ollama: stopped".to_string());
     }
 
@@ -399,10 +394,10 @@ fn build_tooltip(state: &AppState) -> String {
         }
     }
 
-    // Agent server port
+    // FreeCycle listening address
     lines.push(format!(
-        "Agent API: port {}",
-        state.config.agent_server.port
+        "Listening on {}:{}",
+        state.local_ip, state.config.agent_server.port
     ));
 
     let mut tooltip_lines: Vec<String> = Vec::new();
@@ -1128,18 +1123,20 @@ mod tests {
     }
 
     #[test]
-    fn test_tooltip_prefers_download_progress_over_agent_api_port() {
+    fn test_tooltip_prefers_download_progress_over_listening_address() {
         let config = crate::config::FreeCycleConfig::default();
         let mut state = AppState::new(config);
         state.status = FreeCycleStatus::Available;
         state.ollama_running = true;
         state.vram_used_bytes = 2 * 1024 * 1024 * 1024;
         state.vram_total_bytes = 8 * 1024u64 * 1024 * 1024;
+        state.remote_model_install_unlocked_until =
+            Some(Instant::now() + Duration::from_secs(3500));
         state.model_status = vec!["Downloading llama3.1:8b-instruct-q4_K_M: 42%".to_string()];
 
         let tooltip = build_tooltip(&state);
         assert!(tooltip.contains("42%"));
-        assert!(!tooltip.contains("Agent API:"));
+        assert!(!tooltip.contains("Listening on"));
     }
 
     #[test]
