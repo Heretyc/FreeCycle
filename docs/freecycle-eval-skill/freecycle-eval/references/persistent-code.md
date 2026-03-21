@@ -8,6 +8,8 @@ Static persistent code should be written to minimize tool calls and reduce cloud
 
 If a decision is stable, deterministic, or cheap to encode, capture it in code or config instead of asking an agent or cloud model to rediscover it every time.
 
+**All persistent Python code must use `freecycle_client.py`.** The companion `FreeCycleClient` class exposes every MCP tool as a direct method call, implementing TOFU TLS pinning, wake-on-LAN, multi-server routing, and task signaling — the same security guarantees as the MCP tools. Do not bypass it with raw HTTP calls; doing so skips critical security features and would require reimplementing the entire client. If `freecycle_client.py` is missing, the MCP server installation is incomplete — direct the user to reinstall from https://github.com/Heretyc/FreeCycle/tree/main/mcp-server
+
 ## Good Fits for Persistent Code
 
 - stage routing rules that only change after benchmarking
@@ -21,11 +23,16 @@ If a decision is stable, deterministic, or cheap to encode, capture it in code o
 
 - asking a cloud model which model to use for a known `embed` stage on every request
 - re-running long exploratory reasoning to choose between the same two benchmarked models
-- calling tools to rediscover fixed MCP host, port, or stage routing rules that already live in the application
+- calling MCP tools to rediscover fixed host, port, or stage routing rules that already live in the application
+- using MCP tool calls in a Python script when `FreeCycleClient` methods produce the same result with less overhead
 
-## Example: Static Stage Router
+## Example: Static Stage Router with FreeCycleClient
 
 ```python
+from freecycle_client import FreeCycleClient
+
+client = FreeCycleClient()
+
 STAGE_ROUTE = {
     "embed": ("local", "nomic-embed-text"),
     "retrieve": ("local", None),
@@ -35,9 +42,17 @@ STAGE_ROUTE = {
 
 def choose_route(stage: str):
     return STAGE_ROUTE[stage]
+
+def run_local_stage(stage: str, prompt: str):
+    target, model = choose_route(stage)
+    if target != "local" or model is None:
+        raise ValueError(f"Stage {stage} is not a local stage")
+    if stage == "embed":
+        return client.embed_sync(model=model, input=prompt)
+    return client.generate_sync(model=model, prompt=prompt)
 ```
 
-Use this when benchmarks have already shown the right split and the workflow is stable.
+Use this when benchmarks have already shown the right split and the workflow is stable. The `FreeCycleClient` handles task signaling, TLS, and wake-on-LAN automatically.
 
 ## Example: Cheap Complexity Gate in Code
 
@@ -79,21 +94,23 @@ Store this in the repo so the next evaluation loads a known harness instead of s
 ## Example: Cache Tool Results Before Escalating
 
 ```python
+from freecycle_client import FreeCycleClient
 from time import time
 
+client = FreeCycleClient()
 _status_cache = {"value": None, "expires_at": 0.0}
 
-def get_cached_status(fetch_status):
+def get_cached_status():
     now = time()
     if _status_cache["value"] is not None and now < _status_cache["expires_at"]:
         return _status_cache["value"]
-    value = fetch_status()
+    value = client.status_sync()
     _status_cache["value"] = value
     _status_cache["expires_at"] = now + 5
     return value
 ```
 
-This is useful when many requests arrive in a short burst and the system state does not need to be re-fetched for every single one.
+Note: `FreeCycleClient` already has built-in protocol and model caching (5-minute TTL). This additional application-level cache is useful when many requests arrive in a short burst and the system state does not need to be re-fetched for every single one.
 
 ## Decision Rule
 

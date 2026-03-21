@@ -1,10 +1,34 @@
 """FreeCycle GPU Lifecycle Manager — Python Client Library.
 
-A companion module to the Node.js MCP server that provides direct Python access
-to the FreeCycle GPU server API, enabling agentic workflows to bypass MCP protocol
-overhead and write directly to the local inference engine.
+Together with the Node.js MCP server, this is one of the two ONLY supported
+interfaces for interacting with FreeCycle and its local inference engine.  Do not
+access the Ollama API or FreeCycle agent server directly — this client implements
+TOFU TLS pinning, task signaling, wake-on-LAN, and multi-server routing that
+cannot be replicated with raw HTTP calls.
 
-Supports both async (primary) and sync (convenience wrapper) interfaces.
+Every MCP tool has a 1:1 method on FreeCycleClient (async + sync):
+
+    MCP Tool                   -> Async Method            -> Sync Method
+    freecycle_status           -> client.status()         -> client.status_sync()
+    freecycle_health           -> client.health()         -> client.health_sync()
+    freecycle_check_availability -> client.check_availability() -> client.check_availability_sync()
+    freecycle_start_task       -> client.start_task()     -> client.start_task_sync()
+    freecycle_stop_task        -> client.stop_task()      -> client.stop_task_sync()
+    freecycle_list_models      -> client.list_models()    -> client.list_models_sync()
+    freecycle_show_model       -> client.show_model()     -> client.show_model_sync()
+    freecycle_pull_model       -> client.pull_model()     -> client.pull_model_sync()
+    freecycle_generate         -> client.generate()       -> client.generate_sync()
+    freecycle_chat             -> client.chat()           -> client.chat_sync()
+    freecycle_embed            -> client.embed()          -> client.embed_sync()
+    freecycle_evaluate_task    -> client.evaluate_task()  -> client.evaluate_task_sync()
+    freecycle_benchmark        -> client.benchmark()      -> client.benchmark_sync()
+    freecycle_add_server       -> client.add_server()     -> client.add_server_sync()
+    freecycle_list_servers     -> client.list_servers()    -> client.list_servers_sync()
+    freecycle_model_catalog    -> client.model_catalog()  -> client.model_catalog_sync()
+
+All methods produce identical JSON payloads to their MCP counterparts. Use this
+client over MCP tool calls in Python scripts, benchmark harnesses, and persistent
+routing code to reduce token usage and latency.
 
 Example (async):
     >>> import asyncio

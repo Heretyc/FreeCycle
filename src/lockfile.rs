@@ -13,6 +13,7 @@
 //! ```
 
 use anyhow::{Context, Result};
+use std::os::windows::process::CommandExt as _;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
@@ -183,8 +184,10 @@ fn kill_old_process(pid: u32) {
         return;
     }
 
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
     match std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
     {
         Ok(output) if output.status.success() => {

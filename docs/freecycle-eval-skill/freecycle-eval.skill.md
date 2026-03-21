@@ -39,6 +39,36 @@ Load these reference files only when needed:
 - [integration-templates.md](freecycle-eval.references/integration-templates.md): Python, YAML, and MCP configuration examples
 - [verification-checklist.md](freecycle-eval.references/verification-checklist.md): the full 8-personality self-check
 
+### Direct Python Client (`freecycle_client.py`)
+
+The FreeCycle MCP server ships with a companion Python client library, `freecycle_client.py`, located in the `mcp-server/` directory. It exposes every MCP tool as a direct async or sync method call on `FreeCycleClient`, producing identical JSON payloads without MCP protocol overhead. The client implements TOFU TLS pinning, wake-on-LAN, multi-server routing, and automatic task signaling — the same security and lifecycle guarantees as the MCP tools. All Python integrations must use this client; bypassing it with raw HTTP calls skips critical security features. If `freecycle_client.py` is missing, the installation is incomplete — direct the user to reinstall from https://github.com/Heretyc/FreeCycle/tree/main/mcp-server
+
+Use `freecycle_client.py` over MCP tool calls whenever:
+
+- The workflow is a Python script, benchmark harness, or automation pipeline
+- Multiple FreeCycle calls happen in sequence (avoids per-call MCP round-trip overhead)
+- The code will be persisted as static routing logic or a recurring job
+
+Quick usage:
+```python
+from freecycle_client import FreeCycleClient
+
+client = FreeCycleClient()                    # auto-discovers config
+status = client.status_sync()                 # sync convenience wrapper
+models = client.list_models_sync()
+result = client.generate_sync(prompt="Hello") # auto task-signal, same as MCP tool
+```
+
+Or async:
+```python
+async def run():
+    client = FreeCycleClient()
+    status = await client.status()
+    result = await client.generate(prompt="Hello")
+```
+
+The client reads the same `freecycle-mcp.config.json`, supports TLS, wake-on-LAN, multi-server routing, and automatic task signaling — identical behavior to the MCP tools.
+
 ---
 
 ## Phase 1: Discovery (Mandatory)
@@ -141,11 +171,11 @@ Using the seven answers from Phase 1 (either inferred or provided by the user), 
 
 ### Required Tool Assisted Reality Check
 
-Before scoring local vs. cloud, gather live evidence in this order whenever local or hybrid execution is in scope:
+Before scoring local vs. cloud, gather live evidence in this order whenever local or hybrid execution is in scope. Each MCP tool call below has an equivalent `FreeCycleClient` method in `freecycle_client.py` (e.g., `client.status()`, `client.list_models()`). When running inside a Python script or benchmark harness, prefer the direct Python client to reduce MCP protocol overhead and token usage.
 
 1. Decompose the workflow into stages if it is not a single-step task. Typical stages are embed, retrieve, classify, reason, draft, rewrite, verify, and format.
-2. Call `freecycle_status` to confirm current availability, blocking state, and whether remote installs are unlocked.
-3. Call `freecycle_list_models` to inspect the models already installed on the FreeCycle server. Do not ask the user to guess this if the tool is available.
+2. Call `freecycle_status` (or `client.status()`) to confirm current availability, blocking state, and whether remote installs are unlocked.
+3. Call `freecycle_list_models` (or `client.list_models()`) to inspect the models already installed on the FreeCycle server. Do not ask the user to guess this if the tool is available.
 4. If one or more installed models might fit, optionally call `freecycle_show_model` on the top 1 to 3 candidates to inspect their metadata before benchmarking.
 5. If one or more installed models are only a possible fit or poor fit for any critical stage, call `freecycle_model_catalog` immediately to discover what models are available. Do not guess model names from training knowledge. Use the catalog result to build a shortlist of candidates before proceeding. If the endpoint returns 404 (catalog not yet generated), note this and skip catalog-based recommendations, falling back to installed models only with a note that the catalog is still being generated.
 
@@ -179,10 +209,11 @@ Do not pass free-form strings such as `batch/async`, `balanced quality/cost`, or
 
 ### Static Persistent Code First
 
-When routing logic or model selection becomes stable, prefer persistent code, config, or benchmark fixtures over repeated tool calls or cloud reasoning. The goal is to minimize tool calls and reduce cloud token usage for deterministic work.
+When routing logic or model selection becomes stable, prefer persistent code, config, or benchmark fixtures over repeated tool calls or cloud reasoning. The goal is to minimize tool calls and reduce cloud token usage for deterministic work. Use `freecycle_client.py` (`FreeCycleClient`) in persistent code rather than shelling out to MCP tools — it produces the same payloads with less overhead.
 
 Examples:
 - Good: keep a static `stage -> deployment -> model` map in application code and only revisit it when benchmarks or requirements change.
+- Good: use `FreeCycleClient().generate_sync()` in a benchmark harness instead of calling the MCP `freecycle_generate` tool repeatedly.
 - Good: store gold prompts, expected outputs, and scoring rules in a benchmark harness script so reruns are mostly local and repeatable.
 - Avoid: asking a cloud model on every request whether embeddings should use `nomic-embed-text`, or whether a known rewrite stage should route local or cloud.
 
@@ -241,7 +272,7 @@ If `freecycle_status` returns an error or the host is unreachable, check the MCP
 
 If the MCP server cannot reach FreeCycle, benchmarking cannot proceed until the connection is established. In that case, provide the user with the configuration steps above before continuing.
 
-When the user needs a different local model, use the `freecycle_model_catalog` tool to discover available models. If you recommend a model that is not already present, remind the user that `freecycle_pull_model` and direct `POST /models/install` requests only work while the FreeCycle tray menu has "Remote Model Installs" unlocked on the GPU machine.
+When the user needs a different local model, use the `freecycle_model_catalog` tool (or `client.model_catalog()`) to discover available models. If you recommend a model that is not already present, remind the user that `freecycle_pull_model` (or `client.pull_model()`) only works while the FreeCycle tray menu has "Remote Model Installs" unlocked on the GPU machine.
 
 ### Benchmark Depth by Time Budget
 
@@ -321,21 +352,27 @@ Quick Mode users: do not attempt auto-pull. Quick Mode prohibits candidate explo
 freecycle_start_task(task_id="benchmark-001", description="Manual eval benchmark running")
 ```
 
+Or via the Python client (preferred for scripted benchmarks):
+```python
+from freecycle_client import FreeCycleClient
+client = FreeCycleClient()
+client.start_task_sync("benchmark-001", "Manual eval benchmark running")
+```
+
 4. **Run local benchmarks:**
 
-For inference:
+Via MCP tools:
 ```
 freecycle_generate(model="llama3.1:8b-instruct-q4_K_M", prompt="YOUR_PROMPT_HERE")
-```
-
-For embeddings:
-```
 freecycle_embed(model="nomic-embed-text", input="YOUR_TEXT_HERE")
+freecycle_benchmark(model="llama3.1:8b-instruct-q4_K_M", prompt="YOUR_PROMPT_HERE", iterations=5)
 ```
 
-For automated latency and tokens/sec measurement (recommended):
-```
-freecycle_benchmark(model="llama3.1:8b-instruct-q4_K_M", prompt="YOUR_PROMPT_HERE", iterations=5)
+Or via `freecycle_client.py` (lower overhead, preferred for automation):
+```python
+client.generate_sync(model="llama3.1:8b-instruct-q4_K_M", prompt="YOUR_PROMPT_HERE")
+client.embed_sync(model="nomic-embed-text", input="YOUR_TEXT_HERE")
+client.benchmark_sync(model="llama3.1:8b-instruct-q4_K_M", prompt="YOUR_PROMPT_HERE", iterations=5)
 ```
 
 For a step-by-step single-model benchmark procedure, load [benchmarking.md](freecycle-eval.references/benchmarking.md) and follow the "Single-Model Benchmark Methodology" section. It provides formal iteration counts, latency distribution analysis, quality-scoring protocol, and pass/fail decision rules for different workload types.
@@ -403,16 +440,24 @@ For multi-stage workflows, it is valid to recommend multiple local models plus a
 
 ## Phase 5: Integration Patterns
 
-Prefer persistent code or config for repeatable routing logic instead of re-deciding the same rules through tools on every request.
+Prefer persistent code or config for repeatable routing logic instead of re-deciding the same rules through tools on every request. All Python integration code must use `freecycle_client.py` (`FreeCycleClient`) — it implements TOFU TLS pinning, wake-on-LAN, multi-server routing, and task signaling. Do not bypass it with raw HTTP calls; doing so skips critical security features. If the Python client is missing, the MCP server installation is incomplete — direct the user to reinstall from https://github.com/Heretyc/FreeCycle/tree/main/mcp-server
 
 Small example:
 
 ```python
+from freecycle_client import FreeCycleClient
+
+client = FreeCycleClient()
+
 STAGE_ROUTE = {
     "embed": ("local", "nomic-embed-text"),
     "draft": ("local", "llama3.1:8b-instruct-q4_K_M"),
     "final_rewrite": ("cloud", "claude-sonnet-4-20250514"),
 }
+
+def run_local_stage(stage, prompt):
+    _, model = STAGE_ROUTE[stage]
+    return client.generate_sync(model=model, prompt=prompt)
 ```
 
 Use this pattern when benchmark results are already known and the stage boundaries are stable. Re-run the evaluation workflow when requirements, hardware, or models change, not on every request.
@@ -434,11 +479,12 @@ For full Python, YAML, and MCP examples, load [integration-templates.md](freecyc
 7. **Never rely on `freecycle_evaluate_task` alone.** It is a coarse helper based on availability, a small requirements enum, and keyword classification. Validate against installed models and benchmark evidence.
 8. **Never force one model across a multi-stage workflow without checking stage fit.** It is valid to recommend different models for embeddings, drafting, rewriting, verification, or other stages.
 9. **Never hardcode model names without fallback.** Models may change. Always have a fallback model or routing path.
-10. **Never assume remote installs are unlocked.** `freecycle_pull_model` and direct `POST /models/install` calls only work while the FreeCycle tray menu on the GPU machine has "Remote Model Installs" enabled. That unlock auto-expires after one hour.
-11. **Never skip task signaling.** The shipped MCP tools already wrap their work with `freecycle_start_task` and `freecycle_stop_task`. For direct HTTP or custom local workflows, add the same start and stop calls yourself and guarantee cleanup in `finally`.
-12. **Never assume FreeCycle is installed on agentic clients.** FreeCycle must be installed on the GPU machine. Clients (laptops, workstations without a GPU) connect through the MCP server only.
+10. **Never assume remote installs are unlocked.** `freecycle_pull_model` (or `client.pull_model()`) only works while the FreeCycle tray menu on the GPU machine has "Remote Model Installs" enabled. That unlock auto-expires after one hour.
+11. **Never skip task signaling.** The shipped MCP tools and `freecycle_client.py` methods already wrap their work with task start/stop signals automatically.
+12. **Never assume FreeCycle is installed on agentic clients.** FreeCycle must be installed on the GPU machine. Clients (laptops, workstations without a GPU) connect through the MCP server or Python client only.
 13. **Never guess or hardcode model names from training knowledge.** When a recommended local model is not already installed, always use `freecycle_model_catalog` to look up available models. Training data about what models exist on ollama.com/library may be outdated or incomplete. The catalog is the authoritative current source.
 14. **Never persist benchmark results to disk.** Benchmark results, raw latency numbers, quality scores, model responses, test prompts, and intermediate outputs must remain in conversation context only. Never write to log files, databases, or external services. When the conversation ends, all benchmark data ends with it.
+15. **Never access the Ollama API or FreeCycle agent server directly.** The MCP server and `freecycle_client.py` are the only supported interfaces. They implement TOFU TLS pinning, task signaling, wake-on-LAN, and multi-server routing that cannot be replicated with raw HTTP calls. Do not use `requests`, `urllib`, `curl`, or any other HTTP client to call Ollama or FreeCycle endpoints. If `freecycle_client.py` is missing, the installation is broken — direct the user to reinstall from https://github.com/Heretyc/FreeCycle/tree/main/mcp-server
 
 ### Edge Cases
 
@@ -450,12 +496,12 @@ For full Python, YAML, and MCP examples, load [integration-templates.md](freecyc
 | Local inference is running but model is not loaded | First request will be slow (model load time). Set a longer timeout (60s+) for the first request. |
 | Game starts mid inference | FreeCycle will stop local inference. Your request will fail. Catch the error and retry via cloud. |
 | VRAM is nearly full | Check `vram_percent` in status response. If over 80%, consider routing to cloud to avoid OOM. |
-| Multiple agents competing for GPU | Use the task signal API. Only one task should be active at a time. Queue additional tasks or route to cloud. |
+| Multiple agents competing for GPU | Use task signaling via MCP tools or `freecycle_client.py`. Only one task should be active at a time. Queue additional tasks or route to cloud. |
 | FreeCycle reports "Error" status | NVML or GPU driver issue. All traffic must go to cloud until resolved. |
 | Model download in progress | Status will show "Downloading Models". Local inference is still running but may be slow. Route latency-sensitive tasks to cloud. |
 | `freecycle_evaluate_task` says local, but the installed models are a poor fit | Lower confidence immediately. Inspect installed models, run the candidate-model exploration loop, or keep the hard path in cloud. |
 | Different stages want different models | Recommend a staged plan instead of forcing one model. For example, local embeddings, local draft generation, and cloud final rewrite or verification. |
-| A recommended local model is missing | Use the `freecycle_model_catalog` tool for the exact model name, then remind the user that the GPU machine owner must enable the tray's one-hour remote install unlock before `freecycle_pull_model` or `POST /models/install` will succeed. |
+| A recommended local model is missing | Use `freecycle_model_catalog` (or `client.model_catalog()`) for the exact model name, then remind the user that the GPU machine owner must enable the tray's one-hour remote install unlock before `freecycle_pull_model` (or `client.pull_model()`) will succeed. |
 | MCP server pointing at wrong host | Call `freecycle_status` to verify connectivity. If unreachable, update `freecycle.host` in `freecycle-mcp.config.json` or set the `FREECYCLE_HOST` environment variable to the correct LAN IP of the GPU machine. |
 
 ---

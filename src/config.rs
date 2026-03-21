@@ -111,6 +111,12 @@ pub struct GeneralConfig {
 
     #[serde(default = "default_wake_delay_seconds")]
     pub wake_delay_seconds: u64,
+
+    #[serde(default = "default_autostart")]
+    pub autostart: bool,
+
+    #[serde(default)]
+    pub start_menu_shortcut_declined: bool,
 }
 
 /// Ollama process and network configuration.
@@ -242,6 +248,9 @@ fn default_task_timeout_hours() -> u64 {
 fn default_wake_delay_seconds() -> u64 {
     60
 }
+fn default_autostart() -> bool {
+    true
+}
 fn default_ollama_host() -> String {
     "0.0.0.0".to_string()
 }
@@ -319,6 +328,8 @@ impl Default for GeneralConfig {
             vram_idle_timeout_minutes: default_vram_idle_timeout_minutes(),
             task_timeout_hours: default_task_timeout_hours(),
             wake_delay_seconds: default_wake_delay_seconds(),
+            autostart: default_autostart(),
+            start_menu_shortcut_declined: false,
         }
     }
 }
@@ -665,6 +676,26 @@ bind_address = "127.0.0.1"
             deserialized.security.fingerprint_override,
             Some("gpu-fingerprint-123".to_string())
         );
+    }
+
+    #[test]
+    fn test_autostart_defaults_to_true() {
+        let config: FreeCycleConfig = toml::from_str("[general]").unwrap();
+        assert!(config.general.autostart);
+        assert!(!config.general.start_menu_shortcut_declined);
+    }
+
+    #[test]
+    fn test_autostart_round_trip() {
+        let mut config = FreeCycleConfig::default();
+        config.general.autostart = false;
+        config.general.start_menu_shortcut_declined = true;
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: FreeCycleConfig = toml::from_str(&serialized).unwrap();
+
+        assert!(!deserialized.general.autostart);
+        assert!(deserialized.general.start_menu_shortcut_declined);
     }
 
     #[test]

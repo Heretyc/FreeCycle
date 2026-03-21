@@ -350,7 +350,7 @@ fn build_tooltip(state: &AppState) -> String {
         let used_mb = state.vram_used_bytes / (1024 * 1024);
         let total_mb = state.vram_total_bytes / (1024 * 1024);
         let pct = state.vram_used_bytes * 100 / state.vram_total_bytes;
-        lines.push(format!("VRAM: {} / {} MB ({}%)", used_mb, total_mb, pct));
+        lines.push(format!("VRAM: {}/{} MB ({}%)", used_mb, total_mb, pct));
     }
 
     // Ollama status
@@ -404,9 +404,10 @@ fn build_tooltip(state: &AppState) -> String {
     let mut total_len = 0usize;
 
     for line in lines {
-        let separator_len = if tooltip_lines.is_empty() { 0 } else { 1 };
+        // Windows tooltip separators may be \r\n (2 chars), so budget 2 per separator.
+        let separator_len = if tooltip_lines.is_empty() { 0 } else { 2 };
         if total_len + separator_len + line.len() > 127 {
-            break;
+            continue; // Skip this line but try shorter ones below
         }
 
         total_len += separator_len + line.len();

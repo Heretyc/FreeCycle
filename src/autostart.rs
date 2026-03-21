@@ -6,9 +6,13 @@
 //! 3. Enforcing Ollama's network binding to localhost via HKCU\Environment.
 
 use anyhow::{Context, Result};
+use std::os::windows::process::CommandExt as _;
 use tracing::{debug, info, warn};
 use winreg::enums::*;
 use winreg::RegKey;
+
+/// Windows process creation flag: suppress console window for spawned processes.
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// Registry path for user auto-start programs.
 const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -57,12 +61,29 @@ pub fn register_freecycle_autostart() -> Result<()> {
     Ok(())
 }
 
+/// Synchronises the FreeCycle auto-start registry entry with the desired state.
+///
+/// When `enabled` is `true`, ensures the current executable is registered in
+/// `HKCU\...\Run`. When `false`, removes the entry.
+///
+/// Failures are logged as warnings and do not propagate.
+pub fn sync_autostart(enabled: bool) {
+    if enabled {
+        if let Err(e) = register_freecycle_autostart() {
+            warn!("Failed to register FreeCycle auto-start: {}", e);
+        }
+    } else {
+        if let Err(e) = unregister_freecycle_autostart() {
+            warn!("Failed to unregister FreeCycle auto-start: {}", e);
+        }
+    }
+}
+
 /// Removes the FreeCycle auto-start registry entry.
 ///
 /// # Errors
 ///
 /// Returns an error if the registry key cannot be opened or the value cannot be deleted.
-#[allow(dead_code)]
 pub fn unregister_freecycle_autostart() -> Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let run_key = hkcu
@@ -224,6 +245,7 @@ fn disable_ollama_scheduled_tasks() {
     for task_name in &task_names {
         let result = std::process::Command::new("schtasks")
             .args(["/Change", "/TN", task_name, "/DISABLE"])
+            .creation_flags(CREATE_NO_WINDOW)
             .output();
 
         match result {

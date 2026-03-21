@@ -15,6 +15,8 @@ categories = ["command-line-utilities"]
 include = [
     "/src/**",
     "/tests/**",
+    "/build.rs",
+    "/docs/logo.ico",
     "/Cargo.toml",
     "/README.md",
     "/LICENSE",
@@ -46,7 +48,14 @@ sysinfo = "0.32"
 # Windows registry
 winreg = "0.55"
 
-# Win32 APIs
+# Win32 APIs (COM for shell shortcuts)
+windows = { version = "0.58", features = [
+    "Win32_UI_Shell",
+    "Win32_System_Com",
+    "Win32_Storage_FileSystem",
+] }
+
+# Win32 APIs (raw FFI)
 windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
@@ -124,6 +133,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # TLS crypto provider (ring backend)
 rustls = { version = "0.23", features = ["ring"] }
+
+[build-dependencies]
+winresource = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

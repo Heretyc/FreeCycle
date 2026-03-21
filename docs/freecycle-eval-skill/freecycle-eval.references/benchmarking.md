@@ -2,6 +2,8 @@
 
 Use this reference when the main skill determines that local or hybrid execution is plausible and you need more than a coarse recommendation.
 
+**Python client alternative:** Every `freecycle_benchmark`, `freecycle_generate`, and `freecycle_embed` MCP tool call below has an equivalent `FreeCycleClient` method in `freecycle_client.py` (e.g., `client.benchmark_sync()`, `client.generate_sync()`, `client.embed_sync()`). When automating benchmarks in a Python script, prefer the direct client to reduce MCP overhead and token usage.
+
 ## Time Budget Modes
 
 The benchmark depth depends on the time budget from Phase 1, Q6:

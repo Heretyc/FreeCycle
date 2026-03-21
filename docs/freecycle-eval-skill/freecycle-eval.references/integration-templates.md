@@ -2,44 +2,38 @@
 
 Load this reference when the user asks for concrete code or configuration patterns after the evaluation is complete.
 
-## Template 1: Check FreeCycle Status Before Choosing Model
+**Required:** All Python integrations must use `freecycle_client.py` (`FreeCycleClient`). It implements TOFU TLS pinning, wake-on-LAN, multi-server routing, task signaling, and caching — the same security and lifecycle behavior as the MCP tools. Do not bypass it with raw HTTP calls; doing so skips critical security features and would require reimplementing the entire client from scratch.
+
+If `freecycle_client.py` is missing, the MCP server installation is incomplete. Direct the user to reinstall from source: https://github.com/Heretyc/FreeCycle/tree/main/mcp-server
+
+## Template 1: Check Status and Generate
 
 ```python
-import requests
+from freecycle_client import FreeCycleClient
 
-FREECYCLE_URL = "https://localhost:7443"
-FREECYCLE_INFERENCE_URL = "https://localhost:7443"
-
-def get_freecycle_status():
-    """Check if FreeCycle reports local inference as available."""
-    try:
-        resp = requests.get(f"{FREECYCLE_URL}/status", timeout=2)
-        data = resp.json()
-        return data.get("ollama_running", False), data.get("status", "Unknown")
-    except Exception:
-        return False, "Unreachable"
+client = FreeCycleClient()  # auto-discovers freecycle-mcp.config.json
 
 def generate(prompt, prefer_local=True):
     """Generate a response, routing to local or cloud based on availability."""
-    local_available, status = get_freecycle_status()
-
-    if prefer_local and local_available:
-        requests.post(f"{FREECYCLE_URL}/task/start", json={
-            "task_id": "agent-gen-001",
-            "description": "Generating response"
-        })
-        try:
-            resp = requests.post(f"{FREECYCLE_INFERENCE_URL}/api/generate", json={
-                "model": "llama3.1:8b-instruct-q4_K_M",
-                "prompt": prompt,
-                "stream": False
-            }, timeout=60)
-            return resp.json().get("response", "")
-        finally:
-            requests.post(f"{FREECYCLE_URL}/task/stop", json={
-                "task_id": "agent-gen-001"
-            })
+    if prefer_local:
+        status = client.status_sync()
+        if status.get("ollama_running"):
+            # generate() handles task signaling automatically
+            result = client.generate_sync(
+                model="llama3.1:8b-instruct-q4_K_M",
+                prompt=prompt,
+            )
+            return result.get("response", "")
     return call_cloud_api(prompt)
+
+def embed_text(text):
+    """Generate embeddings using the local engine."""
+    result = client.embed_sync(model="nomic-embed-text", input=text)
+    return result.get("embeddings", [])
+
+def run_benchmark(model, prompt, iterations=5):
+    """Benchmark a local model."""
+    return client.benchmark_sync(model=model, prompt=prompt, iterations=iterations)
 ```
 
 ## Template 2: Claude Code MCP Configuration
@@ -109,26 +103,28 @@ routing_rules:
     reason: "FreeCycle unavailable or task too complex for local model"
 ```
 
-## Template 4: Agentic Workflow with FreeCycle Health Check
+## Template 4: Agentic Workflow with FreeCycle Python Client
 
 ```python
-import requests
 import time
+from freecycle_client import FreeCycleClient
 
 class FreeCycleAgent:
-    """Agent that checks FreeCycle health before each operation."""
+    """Agent that checks FreeCycle health before each operation.
 
-    def __init__(self, freecycle_url="https://localhost:7443",
-                 inference_url="https://localhost:7443"):
-        self.freecycle_url = freecycle_url
-        self.inference_url = inference_url
+    Uses the companion freecycle_client.py for all FreeCycle interactions,
+    which handles TLS/TOFU pinning, wake-on-LAN, multi-server routing,
+    and task signaling automatically.
+    """
+
+    def __init__(self, config_path=None):
+        self.client = FreeCycleClient(config_path=config_path)
         self.task_id = f"agent-{int(time.time())}"
 
     def is_local_available(self):
         """Check FreeCycle status and return availability info."""
         try:
-            resp = requests.get(f"{self.freecycle_url}/status", timeout=2)
-            data = resp.json()
+            data = self.client.status_sync()
             return {
                 "available": data.get("ollama_running", False),
                 "status": data.get("status", "Unknown"),
@@ -155,20 +151,11 @@ class FreeCycleAgent:
 
         return "cloud"
 
-    def signal_start(self, description):
-        try:
-            requests.post(f"{self.freecycle_url}/task/start", json={
-                "task_id": self.task_id,
-                "description": description
-            }, timeout=2)
-        except Exception:
-            pass
+    def generate(self, prompt, model="llama3.1:8b-instruct-q4_K_M"):
+        """Generate text locally. Task signaling is handled automatically."""
+        return self.client.generate_sync(model=model, prompt=prompt)
 
-    def signal_stop(self):
-        try:
-            requests.post(f"{self.freecycle_url}/task/stop", json={
-                "task_id": self.task_id
-            }, timeout=2)
-        except Exception:
-            pass
+    def embed(self, text, model="nomic-embed-text"):
+        """Generate embeddings locally. Task signaling is handled automatically."""
+        return self.client.embed_sync(model=model, input=text)
 ```

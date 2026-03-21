@@ -4,6 +4,8 @@
 //! automatically enabling/disabling networked Ollama access when the GPU is available
 //! for LLM compute workloads.
 
+#![windows_subsystem = "windows"]
+
 #[cfg(not(windows))]
 compile_error!("FreeCycle only supports Windows");
 
@@ -11,12 +13,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use freecycle::{
     agent_server, autostart, config, exposure_monitor, gpu_monitor, lockfile, logging,
-    model_catalog, ollama, security, tray, AppState,
+    model_catalog, ollama, security, shortcut, tray, AppState,
 };
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// FreeCycle: GPU-aware Ollama lifecycle manager.
 ///
@@ -81,10 +83,8 @@ fn main() -> Result<()> {
         warn!("Failed to enforce Ollama localhost binding: {}", e);
     }
 
-    // Register FreeCycle to auto-start with Windows
-    if let Err(e) = autostart::register_freecycle_autostart() {
-        warn!("Failed to register FreeCycle auto-start: {}", e);
-    }
+    // Sync FreeCycle auto-start with configuration
+    autostart::sync_autostart(config.general.autostart);
 
     // Ensure Ed25519 keypair exists for secure mode
     match security::ensure_keypair(&config.security) {
@@ -124,6 +124,39 @@ fn main() -> Result<()> {
             "Ollama is not installed. Please download it from https://ollama.ai and install it, \
              then restart FreeCycle."
         );
+    }
+
+    // Ensure Start Menu shortcut exists and is up-to-date
+    match shortcut::check_and_create_shortcut() {
+        shortcut::ShortcutCheckResult::AlreadyCorrect => {
+            debug!("Start Menu shortcut is up-to-date");
+        }
+        shortcut::ShortcutCheckResult::Created => {
+            info!("Start Menu shortcut created");
+        }
+        shortcut::ShortcutCheckResult::Mismatched(old_target) => {
+            if !config.general.start_menu_shortcut_declined {
+                info!(
+                    "Start Menu shortcut points to old location: {}",
+                    old_target
+                );
+                let should_update = show_shortcut_update_dialog(&old_target);
+                if should_update {
+                    match shortcut::update_shortcut() {
+                        Ok(()) => info!("Start Menu shortcut updated"),
+                        Err(e) => warn!("Failed to update Start Menu shortcut: {}", e),
+                    }
+                } else {
+                    config.general.start_menu_shortcut_declined = true;
+                    if let Err(e) = config.save() {
+                        warn!("Failed to save config after shortcut decline: {}", e);
+                    }
+                }
+            }
+        }
+        shortcut::ShortcutCheckResult::Failed(e) => {
+            warn!("Start Menu shortcut check failed: {}", e);
+        }
     }
 
     // Build the async runtime
@@ -212,4 +245,31 @@ fn main() -> Result<()> {
 
     info!("FreeCycle shutting down");
     Ok(())
+}
+
+/// Shows a Yes/No dialog asking if the user wants to update the Start Menu shortcut.
+fn show_shortcut_update_dialog(old_target: &str) -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, IDYES, MB_ICONQUESTION, MB_YESNO};
+
+    let text = format!(
+        "FreeCycle has moved.\n\n\
+         The Start Menu shortcut still points to:\n{}\n\n\
+         Update it to the current location?",
+        old_target
+    );
+    let wide_text: Vec<u16> = OsStr::new(&text).encode_wide().chain(std::iter::once(0)).collect();
+    let wide_caption: Vec<u16> = OsStr::new("FreeCycle").encode_wide().chain(std::iter::once(0)).collect();
+
+    let result = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            wide_text.as_ptr(),
+            wide_caption.as_ptr(),
+            MB_YESNO | MB_ICONQUESTION,
+        )
+    };
+
+    result == IDYES
 }

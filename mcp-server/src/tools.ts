@@ -3,6 +3,20 @@
  *
  * Registers 15 tools covering status, lifecycle, model management,
  * inference, task evaluation, benchmarking, and multi-server routing.
+ *
+ * **For agentic workflows:** The companion Python client `freecycle_client.py`
+ * (shipped alongside this MCP server) exposes the same 15 operations as direct
+ * async/sync method calls.  Calling `FreeCycleClient().status()` (or any other
+ * method) avoids MCP protocol overhead and produces identical JSON payloads,
+ * which reduces token usage and latency for automation scripts, benchmark
+ * harnesses, and persistent routing code.  See the module docstring in
+ * `freecycle_client.py` for usage examples.
+ *
+ * **IMPORTANT:** The MCP server and `freecycle_client.py` are the ONLY
+ * supported interfaces for interacting with FreeCycle and its inference engine.
+ * Do not access the Ollama API or FreeCycle agent server directly — the client
+ * libraries implement TOFU TLS pinning, task signaling, wake-on-LAN, and
+ * multi-server routing that cannot be replicated with raw HTTP calls.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -201,14 +215,14 @@ export function classifyTask(desc: string): "local" | "cloud" | "hybrid" {
 export function registerTools(server: McpServer): void {
   server.tool(
     "freecycle_status",
-    "Get the complete FreeCycle status. If the local inference engine is not responding and wake-on-LAN is enabled in the MCP config, the server silently wakes the FreeCycle host and waits for it before reporting status.",
+    "Get the complete FreeCycle status. If the local inference engine is not responding and wake-on-LAN is enabled in the MCP config, the server silently wakes the FreeCycle host and waits for it before reporting status. For lower overhead in agentic workflows, call FreeCycleClient().status() from the companion freecycle_client.py instead of this MCP tool.",
     {},
     async () => getStatusPayload("freecycle_status"),
   );
 
   server.tool(
     "freecycle_health",
-    "Quick health check for local inference readiness. Uses the same wake-on-LAN preflight as the other local tools when it is enabled in the MCP config.",
+    "Quick health check for local inference readiness. Uses the same wake-on-LAN preflight as the other local tools when it is enabled in the MCP config. Also available as FreeCycleClient().health() via freecycle_client.py.",
     {},
     async () => {
       const best = await router.selectBestServer();
@@ -252,7 +266,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_start_task",
-    "Signal that an agent workflow is beginning GPU work. If the FreeCycle machine is asleep and wake-on-LAN is enabled, this tool wakes it first. If local inference stays unavailable, the response suggests routing to cloud tools.",
+    "Signal that an agent workflow is beginning GPU work. If the FreeCycle machine is asleep and wake-on-LAN is enabled, this tool wakes it first. If local inference stays unavailable, the response suggests routing to cloud tools. Also available as FreeCycleClient().start_task() via freecycle_client.py.",
     {
       task_id: z.string().min(1).describe("Unique identifier for this task."),
       description: z
@@ -285,7 +299,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_stop_task",
-    "Signal that an agent workflow has finished GPU work. Uses the same local availability preflight as task start.",
+    "Signal that an agent workflow has finished GPU work. Uses the same local availability preflight as task start. Also available as FreeCycleClient().stop_task() via freecycle_client.py.",
     {
       task_id: z
         .string()
@@ -317,7 +331,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_check_availability",
-    "Check whether local FreeCycle inference engine is available right now. If wake-on-LAN is enabled, the server wakes the remote FreeCycle host and waits up to the configured maximum before declaring it unavailable.",
+    "Check whether local FreeCycle inference engine is available right now. If wake-on-LAN is enabled, the server wakes the remote FreeCycle host and waits up to the configured maximum before declaring it unavailable. Also available as FreeCycleClient().check_availability() via freecycle_client.py.",
     {},
     async () => {
       const best = await router.selectBestServer();
@@ -382,7 +396,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_list_models",
-    "List all models currently downloaded on the local inference engine. Uses the shared wake-on-LAN readiness flow before hitting the engine.",
+    "List all models currently downloaded on the local inference engine. Uses the shared wake-on-LAN readiness flow before hitting the engine. Also available as FreeCycleClient().list_models() via freecycle_client.py.",
     {},
     async () => {
       const best = await router.selectBestServer();
@@ -415,7 +429,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_show_model",
-    "Get detailed information about a specific model after the local server is confirmed awake and reachable.",
+    "Get detailed information about a specific model after the local server is confirmed awake and reachable. Also available as FreeCycleClient().show_model() via freecycle_client.py.",
     {
       model_name: z
         .string()
@@ -446,7 +460,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_pull_model",
-    "Request download of a new model through FreeCycle's tray-gated install API. The local user must enable remote model installs from the tray menu first; the unlock automatically expires after one hour. Once local readiness succeeds, the tool automatically signals FreeCycle task start and stop around the pull so the tray reflects the active MCP job.",
+    "Request download of a new model through FreeCycle's tray-gated install API. The local user must enable remote model installs from the tray menu first; the unlock automatically expires after one hour. Once local readiness succeeds, the tool automatically signals FreeCycle task start and stop around the pull so the tray reflects the active MCP job. Also available as FreeCycleClient().pull_model() via freecycle_client.py.",
     {
       model_name: z
         .string()
@@ -496,7 +510,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_generate",
-    "Send a text generation request to the local inference engine. The tool first checks engine health, optionally wakes the FreeCycle host, and automatically signals FreeCycle task start and stop around the local job.",
+    "Send a text generation request to the local inference engine. The tool first checks engine health, optionally wakes the FreeCycle host, and automatically signals FreeCycle task start and stop around the local job. Also available as FreeCycleClient().generate() via freecycle_client.py for lower overhead.",
     {
       model: z
         .string()
@@ -567,7 +581,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_chat",
-    "Send a multi-turn chat completion request to the local inference engine. The tool uses the same silent wake-and-wait logic as text generation and automatically signals FreeCycle while the local chat request is running.",
+    "Send a multi-turn chat completion request to the local inference engine. The tool uses the same silent wake-and-wait logic as text generation and automatically signals FreeCycle while the local chat request is running. Also available as FreeCycleClient().chat() via freecycle_client.py for lower overhead.",
     {
       model: z
         .string()
@@ -639,7 +653,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_embed",
-    "Generate vector embeddings using the local inference engine. After the shared readiness check passes, the tool automatically signals FreeCycle task start and stop around the embedding job.",
+    "Generate vector embeddings using the local inference engine. After the shared readiness check passes, the tool automatically signals FreeCycle task start and stop around the embedding job. Also available as FreeCycleClient().embed() via freecycle_client.py for lower overhead.",
     {
       model: z
         .string()
@@ -691,7 +705,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_evaluate_task",
-    "Evaluate whether a task should run locally, in the cloud, or as a hybrid workflow. The local side of the decision uses the same engine health check and optional wake-on-LAN flow as the executable tools.",
+    "Evaluate whether a task should run locally, in the cloud, or as a hybrid workflow. The local side of the decision uses the same engine health check and optional wake-on-LAN flow as the executable tools. Also available as FreeCycleClient().evaluate_task() via freecycle_client.py.",
     {
       task_description: z
         .string()
@@ -800,7 +814,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_benchmark",
-    "Run a simple benchmark against a local model. Uses the same wake-on-LAN readiness flow before starting the benchmark and automatically signals FreeCycle once for the full benchmark run.",
+    "Run a simple benchmark against a local model. Uses the same wake-on-LAN readiness flow before starting the benchmark and automatically signals FreeCycle once for the full benchmark run. Also available as FreeCycleClient().benchmark() via freecycle_client.py.",
     {
       model: z.string().min(1).describe("Model to benchmark."),
       prompt: z.string().min(1).describe("Prompt to use for each iteration."),
@@ -909,7 +923,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_add_server",
-    "Add a new FreeCycle server to the MCP config. Attempts TLS first, falls back to plaintext (compatibility mode). Stores the server entry with approved=false; user must set approved=true in the config file to connect.",
+    "Add a new FreeCycle server to the MCP config. Attempts TLS first, falls back to plaintext (compatibility mode). Stores the server entry with approved=false; user must set approved=true in the config file to connect. Also available as FreeCycleClient().add_server() via freecycle_client.py.",
     {
       ip: z.string().describe("IP address of the FreeCycle server."),
       port: z.number().int().default(7443).describe("Port number (default: 7443)."),
@@ -1007,7 +1021,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_list_servers",
-    "List all configured FreeCycle servers with their current status, reachability, VRAM availability, and approval status. Shows both approved and unapproved servers to help users manage multi-server configurations.",
+    "List all configured FreeCycle servers with their current status, reachability, VRAM availability, and approval status. Shows both approved and unapproved servers to help users manage multi-server configurations. Also available as FreeCycleClient().list_servers() via freecycle_client.py.",
     {},
     async () => {
       const cfg = config.getConfig();
@@ -1059,7 +1073,7 @@ export function registerTools(server: McpServer): void {
 
   server.tool(
     "freecycle_model_catalog",
-    "Fetch the complete model catalog of available models. Returns metadata including model name, description, parameter sizes, quantization variants, tags, and download counts. Use this to browse available models before requesting installations.",
+    "Fetch the complete model catalog of available models. Returns metadata including model name, description, parameter sizes, quantization variants, tags, and download counts. Use this to browse available models before requesting installations. Also available as FreeCycleClient().model_catalog() via freecycle_client.py.",
     {},
     async () => {
       const best = await router.selectBestServer();

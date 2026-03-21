@@ -1,5 +1,7 @@
 # FreeCycle
 
+![FreeCycle](docs/logo.png)
+
 GPU-aware Ollama lifecycle manager for Windows 11. Runs as a system tray application that monitors NVIDIA GPU usage and game processes, automatically enabling and disabling networked Ollama access when the GPU is available for LLM compute workloads.
 
 ## What It Does

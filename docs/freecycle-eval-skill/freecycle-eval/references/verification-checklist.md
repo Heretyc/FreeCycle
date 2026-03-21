@@ -29,6 +29,7 @@ Run this checklist before considering the FreeCycle evaluation skill complete.
 - Are the tool call examples realistic and current?
 - Do the examples show both single-model and multi-model workflows when appropriate?
 - Do the examples include static persistent code patterns where that is the better engineering choice?
+- Do Python examples use `freecycle_client.py` (`FreeCycleClient`) instead of raw HTTP requests?
 
 ## 5. Negative Constraints Guardian
 
